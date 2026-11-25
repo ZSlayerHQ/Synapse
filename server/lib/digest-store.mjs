@@ -21,11 +21,15 @@
 import fs from 'fs';
 
 const ENTRY_CONTENT_CAP = 300; // digest lines cap at 160 anyway; store a bounded excerpt only
+// Bounded per project: at most SEATS_PER_PROJECT seat buckets (a new seat name evicts the project's oldest bucket) and
+// BUCKET_MAX entries in each (the oldest go). One project's seats never evict another project's bucket.
+export const SEATS_PER_PROJECT = 100;
+export const BUCKET_MAX = 100;
 
 // `phase` (diagnostics logs plan rev 3): an optional marker, (name, fn) => fn(), that labels each persistence step so a
 // main-thread stall names the exact one. It returns fn's result or throws fn's error unchanged.
 export function openDigestStore({ file, phase = (name, fn) => fn() }) {
-  let data = {};
+  let data = Object.create(null);
   // Distinguish MISSING from CORRUPT. These were one silent path: any failure fell
   // into `catch { /* fresh store */ }`, so a corrupt store was indistinguishable
   // from a first run and every withheld message vanished with no signal. A missing
@@ -34,7 +38,7 @@ export function openDigestStore({ file, phase = (name, fn) => fn() }) {
   if (fs.existsSync(file)) {
     try {
       const loaded = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (loaded && typeof loaded === 'object') data = loaded;
+      if (loaded && typeof loaded === 'object') data = Object.assign(Object.create(null), loaded);
     } catch (e) {
       const quarantine = `${file}.corrupt-${Date.now()}`;
       try { fs.renameSync(file, quarantine); } catch { /* best effort */ }
@@ -68,16 +72,36 @@ export function openDigestStore({ file, phase = (name, fn) => fn() }) {
     }
   };
   const key = (project, seat) => `${project}|${seat}`;
-  return {
-    push(project, seat, entry) {
-      const k = key(project, seat);
-      const bucket = (data[k] ||= []);
+  // Adds entries to one bucket in memory, within the caps; returns whether anything changed. The caller persists once.
+  function add(project, seat, entries) {
+    const k = key(project, seat);
+    if (!Array.isArray(data[k])) {
+      const mine = Object.keys(data).filter((x) => x.startsWith(`${project}|`));
+      for (const old of mine.slice(0, Math.max(0, mine.length - SEATS_PER_PROJECT + 1))) delete data[old];
+      data[k] = [];
+    }
+    const bucket = data[k];
+    let changed = false;
+    for (const entry of entries) {
       // Idempotent by message id (#485): a replay-routed entry must not duplicate one the dying
       // process already buffered in a restart window — same id lands in the digest exactly once.
-      // Already buffered: state unchanged, so it is durable by definition.
-      if (entry.id && bucket.some((e) => e.id === entry.id)) return true;
+      if (entry.id && bucket.some((e) => e.id === entry.id)) continue;
       bucket.push({ ...entry, content: String(entry.content || '').slice(0, ENTRY_CONTENT_CAP) });
+      changed = true;
+    }
+    if (bucket.length > BUCKET_MAX) bucket.splice(0, bucket.length - BUCKET_MAX);
+    return changed;
+  }
+  return {
+    push(project, seat, entry) {
+      // Already buffered: state unchanged, so it is durable by definition.
+      if (!add(project, seat, [entry])) return true;
       return persist(); // true = durable on disk, false = memory only (logged loudly)
+    },
+    // Many entries for one seat with ONE write of the store (a replay withholds up to a page at once).
+    pushMany(project, seat, entries) {
+      if (!entries.length || !add(project, seat, entries)) return true;
+      return persist();
     },
     // Synchronous snapshot + clear (see header). Returns the snapshot, or an empty
     // array if the clear could not be made durable.

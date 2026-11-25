@@ -7,6 +7,25 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+
+const busProof = createRequire(import.meta.url)('../../shared/bus-proof.cjs');
+// Every test home holds this bus secret (a fixed dummy), so a mock bus can prove itself the way the real bus does.
+export const TEST_BUS_SECRET = 'ab'.repeat(32);
+export function writeBusSecret(home, secret = TEST_BUS_SECRET) {
+  fs.mkdirSync(path.join(home, 'data'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, 'data', 'bus-secret'), `${secret}\n`, { mode: 0o600 });
+  return home;
+}
+// For a mock bus: answers GET /api/bus-proof as the real bus would (with `secret`) and returns true; else false.
+export function answerBusProof(req, res, { secret = TEST_BUS_SECRET, pid = 4242, instance = 'mock-bus' } = {}) {
+  const u = new URL(req.url, 'http://x');
+  if (u.pathname !== '/api/bus-proof') return false;
+  const nonce = u.searchParams.get('nonce') || '';
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ pid, instance, proof: busProof.proofFor(secret, nonce, pid, instance) }));
+  return true;
+}
 
 export const CLIENT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'client');
 export const CLIENT_INDEX = path.join(CLIENT_DIR, 'index.js');
@@ -19,10 +38,20 @@ export function tempHome(prefix = 'synapse-client-home-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-// Pins this process's environment for an import-only client. Returns the temp home.
-export function pinEnv(extra = {}) {
+// Writes the home files the client binds to: projects.json registering `project` at `root` with key variable `keyEnv`,
+// and, when `port` is given, synapse.config.json pointing at 127.0.0.1:<port> (the only bus the client will talk to).
+export function bindHome(home, { port, project = 'testproj', keyEnv = 'DEV_SYNC_KEY', root = process.cwd(), roster } = {}) {
+  writeBusSecret(home);
+  fs.writeFileSync(path.join(home, 'projects.json'), JSON.stringify({ projects: { [project]: { keyEnv, root: root.replace(/\\/g, '/'), ...(roster ? { roster } : {}) } } }));
+  if (port !== undefined) fs.writeFileSync(path.join(home, 'synapse.config.json'), JSON.stringify({ version: 2, server: { host: '127.0.0.1', port } }));
+  return home;
+}
+
+// Pins this process's environment for an import-only client. Returns the temp home, which registers project testproj at
+// this process's working folder (key variable DEV_SYNC_KEY); `bind.port` points the client at a mock bus.
+export function pinEnv(extra = {}, bind = {}) {
   for (const k of AMBIENT) delete process.env[k];
-  const home = tempHome();
+  const home = bindHome(tempHome(), bind);
   Object.assign(process.env, {
     SYNAPSE_MCP_IMPORT_ONLY: '1',
     DEV_SYNC_SEAT: '',

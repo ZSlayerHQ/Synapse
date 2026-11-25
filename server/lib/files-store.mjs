@@ -125,8 +125,8 @@ export function filesPressureMessage({ total, maxBytes, ratio, rows, evicted = 0
   const pct = Math.min(100, Math.round(ratio * 100));
   const head = `${mention} **The Synapse file store is ${pct}% full**: ${fmt(total)} of ${fmt(maxBytes)} across ${rows} files.`;
   const already = evicted > 0
-    ? ` It has ALREADY deleted ${evicted} of the oldest files, across every project, to stay under the budget.`
-    : ' At 100% it starts deleting the OLDEST files first, across every project.';
+    ? ` It has ALREADY deleted ${evicted} of the uploading project's oldest files to stay under the budget.`
+    : ' At 100% an upload deletes its own project\'s OLDEST files first, never another project\'s.';
   const actions = ' To clean it out: there is no self-serve delete yet, so tell the Synapse maintainer what to prune,'
     + ' or raise SYNAPSE_FILES_MAX_BYTES in dev-sync/.env and restart :4100 (the value is read once at boot).';
   return head + already + actions;
@@ -269,6 +269,7 @@ export function agentReadPayload(file) {
 export function createFilesStore(dbPath, {
   defaultProject = 'default',
   maxBytes = 10 * 1024 * 1024 * 1024,
+  projectMaxBytes = maxBytes,        // one project's share: an upload evicts only its own project's files
   pressureRatio = 0.85,              // alarm at 85% of budget, well before the eviction backstop
   pressureCooldownMs = 6 * 60 * 60 * 1000,
   onPressure = null,                 // ({total, maxBytes, ratio, rows}) => void; best-effort, never throws upward
@@ -314,7 +315,9 @@ export function createFilesStore(dbPath, {
   const existsStmt = db.prepare('SELECT 1 AS present FROM files WHERE id = ?');
   const sumStmt = db.prepare('SELECT COALESCE(SUM(size), 0) AS total FROM files');
   const countStmt = db.prepare('SELECT COUNT(*) AS n FROM files');
-  const oldestStmt = db.prepare('SELECT id, size FROM files ORDER BY rowid ASC LIMIT 1'); // rowid = reliable insertion order (created_at can tie at sub-ms)
+  const projectSumStmt = db.prepare('SELECT COALESCE(SUM(size), 0) AS total FROM files WHERE project = ?');
+  // rowid = reliable insertion order (created_at can tie at sub-ms). Never the file being stored, never another project's.
+  const oldestOwnStmt = db.prepare('SELECT id, size FROM files WHERE project = ? AND id != ? ORDER BY rowid ASC LIMIT 1');
   const deleteStmt = db.prepare('DELETE FROM files WHERE id = ?');
 
   const insertShotStmt = db.prepare(
@@ -334,11 +337,11 @@ export function createFilesStore(dbPath, {
   const deleteShotStmt = db.prepare('DELETE FROM screenshots WHERE file_id = ?');
 
   // Bound the DB. Two mechanisms :
-  //   1. ASK A HUMAN once usage is at or over `pressureRatio` of the budget. This is the intended mechanism:
-  //      eviction is GLOBAL oldest-first across every project, so the old behaviour silently deleted one
-  //      project's attachments to make room for another's. An alarm the operator can act on is the fix.
-  //   2. Evict oldest-first ONLY as a last-resort backstop at 100%, so a store nobody cleans still cannot
-  //      grow without bound and fill the disk. Reaching it means the alarm was missed.
+  //   1. ASK A HUMAN once usage is at or over `pressureRatio` of the budget. An alarm the operator can act on is the
+  //      intended mechanism.
+  //   2. Evict oldest-first as the backstop, ONLY within the uploading project: when that project passes its share
+  //      (projectMaxBytes) or the store passes the whole budget. One project's uploads never delete another project's
+  //      files; when the project's own older files cannot make room, the new file is refused (OVER_BUDGET) instead.
   // Evaluation order: the backstop runs FIRST so the alarm reports POST-eviction numbers. A pre-eviction read
   // could say "114% full", self-contradictory exactly when it matters most (reviewer finding 9, 2026-09-12).
   // The alarm still fires then, since a store that just evicted is by definition over the line, and `evicted`
@@ -348,18 +351,26 @@ export function createFilesStore(dbPath, {
   // not the re-arm, bounds the next alarm to within `pressureCooldownMs`.
   let pressureNotifiedAt = 0;
   let pressureArmed = true;
-  function enforceBudget() {
-    if (!maxBytes) return;
+  const overBudget = (message) => Object.assign(new Error(`files-store: ${message}`), { code: 'OVER_BUDGET' });
+  function enforceBudget(project, newId) {
+    if (!maxBytes && !projectMaxBytes) return;
     let total = sumStmt.get().total;
+    let own = projectSumStmt.get(project).total;
     let evicted = 0;
-    while (total > maxBytes) {
-      const oldest = oldestStmt.get();
+    while ((projectMaxBytes && own > projectMaxBytes) || (maxBytes && total > maxBytes)) {
+      const oldest = oldestOwnStmt.get(project, newId);
       if (!oldest) break;
       deleteStmt.run(oldest.id);
       deleteShotStmt.run(oldest.id); // drop any gallery metadata for the evicted blob (no-op if not a screenshot)
       total -= oldest.size;
+      own -= oldest.size;
       evicted++;
     }
+    if ((projectMaxBytes && own > projectMaxBytes) || (maxBytes && total > maxBytes)) {
+      deleteStmt.run(newId); // room only by deleting another project's files: refuse this one instead
+      throw overBudget('no room in the store without deleting another project\'s files');
+    }
+    if (!maxBytes) return;
     if (total >= maxBytes * pressureRatio) {
       const now = Date.now();
       if (pressureArmed || now - pressureNotifiedAt >= pressureCooldownMs) {
@@ -387,9 +398,9 @@ export function createFilesStore(dbPath, {
   // Persist a file. `project` MUST be the server-authenticated project (never a body-supplied value).
   // Throws if project is missing or the file type is not allowed. Returns metadata + (for
   // inlinePreview tiers, under the byte cap) an untrusted-wrapped text preview for the bus message.
-  // MCP phase 0 C5: a file larger than the whole budget is refused BEFORE it is written. Enforcement evicts oldest-first, so
-  // such a file used to delete every other stored file, across projects, and then itself, while its id was still returned.
-  // Any file within the budget survives its own enforcement (once every older row is gone, the total is its own size).
+  // A file larger than its project's share (or the whole budget) is refused BEFORE it is written (OVER_BUDGET). A file
+  // within the share survives its own enforcement: eviction never picks the file being stored, and a file that would need
+  // another project's files deleted is removed again and refused.
   // An error after that point carries `storedFileId` only when the row is read back present, so a caller can tell a stored
   // file from one that never landed.
   function storeFile({ project, uploader, filename, mimetype, buffer, createdAt }) {
@@ -397,13 +408,13 @@ export function createFilesStore(dbPath, {
     const tier = classifyTier(filename);
     if (!tier) throw new Error('files-store: file type not allowed');
     const size = buffer.length;
-    if (maxBytes && size > maxBytes) throw new Error('files-store: file exceeds the store budget');
+    if ((maxBytes && size > maxBytes) || (projectMaxBytes && size > projectMaxBytes)) throw overBudget('file exceeds the project\'s share of the store');
     const id = randomUUID();
     const sha256 = createHash('sha256').update(buffer).digest('hex');
     const ts = createdAt || new Date().toISOString();
     try {
       insertStmt.run(id, project, uploader || null, filename, mimetype || null, size, sha256, tier, buffer, ts);
-      enforceBudget();
+      enforceBudget(project, id);
       const def = FILE_TIERS[tier];
       let preview = null;
       if (def.inlinePreview && size <= PREVIEW_MAX_BYTES) {

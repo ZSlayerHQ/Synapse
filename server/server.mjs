@@ -25,7 +25,7 @@ import { resolveHome, homePaths, loadEnvFile, writeJsonAtomic, readJson } from '
 import { loadHomeConfig, hasFatal, DEFAULT_DISCORD_TOKEN_ENV } from './lib/config.mjs';
 import { createRedactor } from './lib/redact.mjs';
 import { createPeople } from './lib/people.mjs';
-import { createAuth, seatBase, isAbsentActor } from './lib/auth.mjs';
+import { createAuth, seatBase, isAbsentActor, projectEntry } from './lib/auth.mjs';
 import { sanitizeText } from './lib/sanitize.mjs';
 import { classifyDelivery, formatDigest } from './lib/delivery-filter.mjs';
 import { openDigestStore } from './lib/digest-store.mjs';
@@ -37,6 +37,7 @@ import { multipartBoundary } from './lib/upload-errors.mjs';
 import { withStandingButtons, buildDeliverBackMessage, DISMISS_LABEL } from './lib/ask-text.mjs';
 import { loadHumanChannel } from './lib/human-channel.mjs';
 import lockKeys from '../shared/lock-key.cjs';
+import busProof from '../shared/bus-proof.cjs';
 
 const { lockKey, foldKey, caseInsensitiveAt } = lockKeys;
 
@@ -51,6 +52,30 @@ const TASK_MAX = 200;
 const ERROR_MAX = 200;
 const LOG_BUFFER_MAX = 200;
 const NOTIFY_MAX = 200;
+// Per project: pending alerts, seat entries (and log buffers), and locks. Free text a seat stores is capped too.
+const ALERT_MAX = 200;
+const DEVELOPER_MAX = 100;
+const LOCK_MAX = 500;
+const WORKING_ON_MAX = 500;
+const BRANCH_MAX = 200;
+const REASON_MAX = 500;
+const FILE_PATH_MAX = 4096;
+// Every other stored field has a size cap too, so a per-project count cap is also a byte cap.
+const META_MAX = 2048;         // message meta, as JSON
+const SHORT_MAX = 32;          // task status and type, error severity and line, log level
+const FILENAME_MAX = 255;
+const BLOCKED_BY_MAX = 50;
+const short = (v, n) => (v === undefined || v === null || typeof v === 'number' || typeof v === 'boolean' ? v : String(v).slice(0, n));
+// Message meta: a plain object whose JSON is at most META_MAX characters, else null (refused, never stored).
+const boundedMeta = (meta) => {
+  if (meta === undefined || meta === null) return {};
+  if (typeof meta !== 'object' || Array.isArray(meta)) return {};
+  try { return JSON.stringify(meta).length <= META_MAX ? meta : null; } catch { return null; }
+};
+const SIGNIN_FREE_FAILURES = 5;
+const SIGNIN_BACKOFF_MAX_MS = 60_000;
+const SIGNIN_FORGET_MS = 15 * 60_000;
+const SIGNIN_TRACK_MAX = 10_000;
 const LOCK_EXPIRE_MS = 30 * 60 * 1000;
 const RECENT_EDIT_WARNING_MS = 10 * 60 * 1000;
 const IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -62,8 +87,9 @@ const PRIORITIES = new Set(['info', 'action', 'urgent']);
 const CASE_INSENSITIVE_FS_EARLY = process.platform === 'win32' || process.platform === 'darwin';
 const isLoopback = (addr) => typeof addr === 'string' && (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1');
 
+// An empty string never matches: a missing key and a project without one must not compare equal.
 function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
   const x = Buffer.from(a), y = Buffer.from(b);
   return x.length === y.length && timingSafeEqual(x, y);
 }
@@ -106,12 +132,18 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   const PORT = Number(port ?? env.SYNAPSE_PORT ?? config.server.port);
   const HOST = host ?? env.SYNAPSE_HOST ?? config.server.host;
   const people = createPeople(config);
-  const auth = createAuth({ registry, env, people });
+  const auth = createAuth({ registry, env, people, systemSender: config.systemSender });
   const projectIds = () => Object.keys(registry.projects || {});
+  // Every lookup of a project by a request value goes through here: a valid id held as the registry's own property, so an
+  // inherited name ("constructor", "__proto__") is never a project.
+  const projectOf = (id) => projectEntry(registry, id);
   const DEFAULT_PROJECT = config.defaultProject || projectIds()[0] || null;
   const SYSTEM = config.systemSender;
   const CHANNELS = new Set([...config.channels, 'all']);
   fs.mkdirSync(paths.data, { recursive: true, mode: 0o700 });
+  // Proof of bus (shared/bus-proof.cjs): the per-install secret, created once (0600) and reused; never sent anywhere.
+  const BUS_SECRET = busProof.ensureSecret(paths.data);
+  const INSTANCE = randomUUID(); // per boot: bound into every proof, so the CLI can trust the pid it stops
   // Every key the bus knows, so text leaving the machine through a pack can never carry one (server/lib/redact.mjs).
   const PACK_SECRET_ENV = config.discord.tokenEnv || DEFAULT_DISCORD_TOKEN_ENV;
   const knownSecrets = [env[PACK_SECRET_ENV]];
@@ -137,9 +169,9 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   if (msgIdCounter > 0) msgIdCounter += 1000; // a crash can lose the last autosave; never reissue an id a client has seen
   const errors = [];
   const pendingLocks = loaded.locks || [];
-  const logBuffers = {};
+  const logBuffers = new Map(); // `${project}|${developer}` -> { developer, project, rows }: a bot name in two projects keeps two buffers
   const notifications = [];
-  const evictedMax = loaded.evictedMax && typeof loaded.evictedMax === 'object' ? loaded.evictedMax : {};
+  const evictedMax = Object.assign(Object.create(null), loaded.evictedMax && typeof loaded.evictedMax === 'object' ? loaded.evictedMax : {});
 
   function saveState() {
     try {
@@ -148,7 +180,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
         developers: [...developers.values()],
         locks: [...locks.values()],
         alerts: alerts.filter((a) => !a.acknowledged),
-        activity: activity.slice(0, ACTIVITY_MAX),
+        activity,
         messages: messageHistory,
         msgIdCounter,
         tasks,
@@ -169,9 +201,12 @@ export async function createBus({ home, env = process.env, port, host, log = (li
 
   // ─── Stores ───
   const askStore = openAskStore(path.join(paths.data, 'ask.db'));
+  const FILES_MAX_BYTES = Number(env.SYNAPSE_FILES_MAX_BYTES) || 2 * 1024 * 1024 * 1024;
   const filesStore = createFilesStore(path.join(paths.data, 'files.db'), {
     defaultProject: DEFAULT_PROJECT || 'default',
-    maxBytes: Number(env.SYNAPSE_FILES_MAX_BYTES) || 2 * 1024 * 1024 * 1024,
+    maxBytes: FILES_MAX_BYTES,
+    // Each project gets an equal share and evicts only its own files, so one project's uploads never delete another's.
+    projectMaxBytes: Math.floor(FILES_MAX_BYTES / Math.max(1, projectIds().length)),
     onPressure: () => {},
   });
   const digestStore = openDigestStore({ file: path.join(paths.data, 'digest-state.json') });
@@ -186,18 +221,43 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   };
   const scopeFilter = (req) => (row) => inScope(req, row.project);
 
+  // Every capped list is capped per project: a write drops only its own project's oldest entries, never another's.
+  function capPerProject(list, project, max, { newestFirst }) {
+    let excess = -max;
+    for (const e of list) if (e.project === project) excess++;
+    if (newestFirst) { for (let i = list.length - 1; i >= 0 && excess > 0; i--) if (list[i].project === project) { list.splice(i, 1); excess--; } }
+    else { for (let i = 0; i < list.length && excess > 0; i++) if (list[i].project === project) { list.splice(i, 1); i--; excess--; } }
+  }
+  // Seat entries are capped per project: the least recently seen go first, offline before active, never `keepKey`.
+  function capDevelopers(project, keepKey) {
+    const mine = [...developers.entries()].filter(([k, d]) => d.project === project && k !== keepKey);
+    let excess = mine.length + (keepKey && developers.has(keepKey) ? 1 : 0) - DEVELOPER_MAX;
+    if (excess <= 0) return;
+    mine.sort(([, a], [, b]) => (a.status === 'active') - (b.status === 'active') || String(a.lastSeen).localeCompare(String(b.lastSeen)));
+    for (const [k] of mine) { if (excess-- <= 0) break; developers.delete(k); }
+  }
+  // Alerts are capped per project: acknowledged ones are dropped first (they are never read again), then the oldest.
+  function capAlerts(project) {
+    for (let i = alerts.length - 1; i >= 0; i--) if (alerts[i].project === project && alerts[i].acknowledged) alerts.splice(i, 1);
+    capPerProject(alerts, project, ALERT_MAX, { newestFirst: false });
+  }
   function addActivity(developer, action, file, message, project = DEFAULT_PROJECT) {
     activity.unshift({ id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, developer, action, file, message, project, timestamp: new Date().toISOString() });
-    if (activity.length > ACTIVITY_MAX) activity.length = ACTIVITY_MAX;
+    capPerProject(activity, project, ACTIVITY_MAX, { newestFirst: true });
   }
   // Lock keys come from shared/lock-key.cjs, the one policy the hooks use too: relative to the project root when inside
   // it, the full absolute path otherwise, case-matched as the project's own folder is. Locks are advisory: an edit made
   // outside the hooks (a shell command) or while the bus is down is not checked.
-  const rootOf = (project) => (registry.projects[project] && registry.projects[project].root) || null;
+  const rootOf = (project) => (projectOf(project) && projectOf(project).root) || null;
   const ciOf = (project) => caseInsensitiveAt(rootOf(project));
   const lockPath = (project, file) => lockKey(rootOf(project), file, { caseInsensitive: ciOf(project) });
   const lockId = (project, p) => `${project}|${foldKey(p, ciOf(project))}`;
   const sameFile = (project, a, b) => foldKey(a, ciOf(project)) === foldKey(b, ciOf(project));
+  // A state file written before these caps (or by hand) is brought under them at boot.
+  for (const p of new Set([...alerts.map((a) => a.project), ...[...developers.values()].map((d) => d.project)])) {
+    capAlerts(p);
+    capDevelopers(p, null);
+  }
   function cleanExpiredLocks() {
     const now = Date.now();
     for (const [k, lock] of locks) {
@@ -210,7 +270,11 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   let humanChannel = null; // set before listen
   const relay = (msg) => { try { humanChannel && humanChannel.relayMessage && humanChannel.relayMessage(msg); } catch (e) { log(`[synapse] relay failed: ${e.message}`); } };
 
-  const deliveryCfgFor = (project, seat) => registry.projects[project]?.delivery?.[seatBase(seat)];
+  const deliveryCfgFor = (project, seat) => {
+    const d = projectOf(project)?.delivery;
+    const base = seatBase(seat);
+    return d && typeof d === 'object' && typeof base === 'string' && Object.hasOwn(d, base) ? d[base] : undefined;
+  };
   const projectHumansLower = (project) => new Set(people.humansIn(project).map((h) => h.toLowerCase()));
   const humanNameFor = (project, to) => {
     if (!to) return null;
@@ -256,7 +320,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
       sender: sanitizeText(sender, ACTOR_MAX),
       content: sanitizeText(content, CONTENT_MAX),
       project,
-      meta: meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {},
+      meta: boundedMeta(meta) || {},
       timestamp: new Date().toISOString(),
     };
     messageHistory.unshift(msg);
@@ -328,7 +392,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   });
   function noteForPeople(project, entry) {
     notifications.unshift({ id: `ntf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, project, timestamp: new Date().toISOString(), ...entry });
-    if (notifications.length > NOTIFY_MAX) notifications.length = NOTIFY_MAX;
+    capPerProject(notifications, project, NOTIFY_MAX, { newestFirst: true });
   }
 
   // ─── The one answer path for decision cards (dashboard now, any pack later) ───
@@ -377,7 +441,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     if (!declaredProvider(provider)) return { ok: false, error: 'undeclared_provider' };
     const person = people.byExternalId(provider, accountId);
     if (!person) return { ok: false, error: 'unknown_account' };
-    if (!registry.projects[project] || !people.allowedIn(person, project)) return { ok: false, error: 'not_allowed' };
+    if (!projectOf(project) || !people.allowedIn(person, project)) return { ok: false, error: 'not_allowed' };
     if (!CHANNELS.has(channel)) return { ok: false, error: 'unknown_channel' };
     if (typeof content !== 'string' || !content) return { ok: false, error: 'empty' };
     const msg = sendToChannel(channel, person, content, { via: String(provider) }, project);
@@ -425,11 +489,47 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   app.get('/', dashboardGate, (req, res) => res.sendFile(path.join(dashboardDir, 'index.html')));
   app.use('/dashboard', dashboardGate, express.static(dashboardDir, { index: 'index.html', maxAge: 0 }));
 
-  const apiLimiter = rateLimit({ windowMs: 60_000, limit: 1200, standardHeaders: 'draft-7', legacyHeaders: false, skip: isHealthProbe });
-  // Failed personal-key attempts are limited per address: 20 per 15 minutes.
-  const humanLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, skipSuccessfulRequests: true, standardHeaders: 'draft-7', legacyHeaders: false });
-  app.use('/api', apiLimiter);
-  app.use('/api', (req, res, next) => (req.headers['x-synapse-human'] !== undefined ? humanLimiter(req, res, next) : next()));
+  // Proof of bus, before any key is involved: an HMAC of the caller's nonce (with this pid and instance) under the secret.
+  app.get('/api/bus-proof', (req, res) => {
+    const nonce = req.query.nonce;
+    if (typeof nonce !== 'string' || !busProof.NONCE_RE.test(nonce) || hasBody(req)) return res.status(400).json({ error: 'bad_nonce' });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ pid: process.pid, instance: INSTANCE, proof: busProof.proofFor(BUS_SECRET, nonce, process.pid, INSTANCE) });
+  });
+  // Failed personal-key attempts back off per (source, person name): SIGNIN_FREE_FAILURES free failures, then a wait that
+  // doubles from 1 s up to SIGNIN_BACKOFF_MAX_MS. Failures under one name never delay another name. A success does not
+  // clear the record (the owner and a guesser on one machine share a source, so clearing would hand the guesser fresh
+  // tries on every dashboard call); 15 quiet minutes forget it. A key that already verified on this bus passes during the
+  // wait (see below), so failures under an owner's name cannot hold that owner out.
+  const signinFailures = new Map(); // `${source}|${name}` -> { fails, until, last }
+  // The source: every loopback address is one source (a local caller can pick any 127.x address and would otherwise get
+  // fresh guesses from each), an IPv6 address counts by its /64, anything else by its address. Names that are not
+  // configured share one record per source, so made-up names cannot crowd a person's record out of the table.
+  const sourceOf = (req) => {
+    let a = String(req.socket.remoteAddress || '');
+    if (a.startsWith('::ffff:')) a = a.slice(7);
+    if (a === '::1' || /^127\./.test(a)) return 'loopback';
+    return a.includes(':') ? a.split(':').slice(0, 4).join(':') : a;
+  };
+  const signinKey = (req, name) => `${sourceOf(req)}|${typeof name === 'string' && people.exists(name) ? name : '?'}`;
+  function signinWaitMs(sk) {
+    const rec = signinFailures.get(sk);
+    return rec ? Math.max(0, rec.until - Date.now()) : 0;
+  }
+  function noteSigninFailure(sk) {
+    const now = Date.now();
+    let rec = signinFailures.get(sk);
+    if (!rec || now - rec.last > SIGNIN_FORGET_MS) rec = { fails: 0, until: 0, last: now };
+    rec.fails += 1;
+    rec.last = now;
+    if (rec.fails >= SIGNIN_FREE_FAILURES) rec.until = now + Math.min(1000 * 2 ** (rec.fails - SIGNIN_FREE_FAILURES), SIGNIN_BACKOFF_MAX_MS);
+    signinFailures.delete(sk);
+    signinFailures.set(sk, rec); // Map order = least recently failed first, for the size bound below
+    if (signinFailures.size > SIGNIN_TRACK_MAX) {
+      for (const [k, r] of signinFailures) { if (signinFailures.size <= SIGNIN_TRACK_MAX) break; if (r.until <= now) signinFailures.delete(k); }
+      while (signinFailures.size > SIGNIN_TRACK_MAX) signinFailures.delete(signinFailures.keys().next().value);
+    }
+  }
 
   // ─── Authentication: one principal per request ───
   app.use('/api', (req, res, next) => {
@@ -437,12 +537,22 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const key = req.headers['x-dev-key'];
     const human = req.headers['x-synapse-human'];
     const asserted = req.headers['x-dev-project'];
-    if (asserted !== undefined && (typeof asserted !== 'string' || !registry.projects[asserted])) {
+    if (asserted !== undefined && !projectOf(asserted)) {
       return res.status(400).json({ error: 'unknown_project', message: 'Unknown X-Dev-Project header' });
     }
     if (human !== undefined) {
       // A person: the name must be configured and the personal key must verify. Unknown names are refused.
+      const sk = signinKey(req, human);
+      // A person whose key already verified on this bus (the dashboard sends it with every call) is never held by the
+      // backoff: that check compares a hash in memory, so it gives a guesser nothing, and failures under the person's name
+      // cannot lock them out. Everyone else waits out the backoff before any key is tried.
+      const wait = signinWaitMs(sk);
+      if (wait > 0 && !people.knownGood(human, key)) {
+        res.setHeader('Retry-After', String(Math.ceil(wait / 1000)));
+        return res.status(429).json({ error: 'too_many_attempts', message: 'Too many wrong personal keys for this name; wait and try again.' });
+      }
       if (typeof human !== 'string' || typeof key !== 'string' || !people.verifyKey(human, key)) {
+        noteSigninFailure(sk);
         return res.status(401).json({ error: 'unauthorized', message: 'Unknown person or wrong personal key' });
       }
       const project = asserted || (people.allowedIn(human, DEFAULT_PROJECT) ? DEFAULT_PROJECT : projectIds().find((p) => people.allowedIn(human, p)));
@@ -452,13 +562,25 @@ export async function createBus({ home, env = process.env, port, host, log = (li
       return next();
     }
     const project = asserted || DEFAULT_PROJECT;
-    if (!project || !registry.projects[project]) return res.status(400).json({ error: 'unknown_project', message: 'Unknown X-Dev-Project header' });
+    if (!projectOf(project)) return res.status(400).json({ error: 'unknown_project', message: 'Unknown X-Dev-Project header' });
+    // A missing or empty key never authenticates, whatever the project.
+    if (typeof key !== 'string' || !key) return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid X-Dev-Key header' });
     const bot = auth.matchBotKey(project, key);
     if (bot) { req.botPrincipal = bot; req.authProject = project; return next(); }
-    if (!safeEqual(key, auth.projectKey(project) || '')) return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid X-Dev-Key header' });
+    const projectKey = auth.projectKey(project);
+    if (!projectKey || !safeEqual(key, projectKey)) return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid X-Dev-Key header' });
     req.authProject = project;
     next();
   });
+  // The request budget is per authenticated principal (a person, a per-bot key, or a project key in its project), counted
+  // after authentication: a flood of failing requests from one address, or one project's traffic, can never use up
+  // another caller's budget. Failing requests cost a key comparison (personal keys have their own backoff above) and
+  // never get a body parsed.
+  const apiLimiter = rateLimit({
+    windowMs: 60_000, limit: 1200, standardHeaders: 'draft-7', legacyHeaders: false, skip: isHealthProbe,
+    keyGenerator: (req) => `${req.authProject}|${req.humanPrincipal ? `person:${req.humanPrincipal}` : req.botPrincipal ? `bot:${req.botPrincipal}` : 'project'}`,
+  });
+  app.use('/api', apiLimiter);
   // Bodies are parsed only after authentication, so an unauthenticated caller never makes the bus read a body.
   app.use(express.json({ limit: '1mb' }));
   app.use((err, req, res, next) => {
@@ -470,11 +592,13 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   const forged = (res) => res.status(403).json({ error: 'identity_not_in_project_roster', message: 'The presented credential may not post as this identity.' });
   app.use('/api', (req, res, next) => (isHealthProbe(req) || !auth.rejectForgedActor(req) ? next() : forged(res)));
   const actorOf = (req, field) => req.humanPrincipal || req.body?.[field];
+  // Who authenticated, for a write that names no actor: the person, the bot of a per-bot key, else the project key itself.
+  // Never a reserved name ('dashboard', 'unknown'): those only ever mean the bus.
+  const principalOf = (req) => req.humanPrincipal || req.botPrincipal || `project:${req.authProject}`;
 
   // ─── Health and identity ───
   const startedAt = Date.now();
-  const INSTANCE = randomUUID(); // lets the CLI prove a pid belongs to this bus before it stops it
-  app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), busUptime: (Date.now() - startedAt) / 1000, pid: process.pid, instance: INSTANCE, version: PKG.version, humanChannel: humanChannel ? humanChannel.name : null, humanChannelStatus: channelStatus() }));
+  app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), busUptime: (Date.now() - startedAt) / 1000, pid: process.pid, version: PKG.version, humanChannel: humanChannel ? humanChannel.name : null, humanChannelStatus: channelStatus() }));
   function channelStatus() {
     try {
       const s = humanChannel ? humanChannel.status() : null;
@@ -493,8 +617,11 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   app.post('/api/checkin', (req, res) => {
     const { developer, branch, workingOn } = req.body || {};
     if (!developer) return res.status(400).json({ error: 'developer required' });
-    developers.set(`${req.authProject}|${developer}`, { name: developer, project: req.authProject, status: 'active', workingOn: workingOn || '', branch: branch || 'main', filesEditing: [], lastSeen: new Date().toISOString(), lastAction: 'Checked in' });
-    addActivity(developer, 'checkin', null, `${developer} checked in on branch ${branch || 'main'}`, req.authProject);
+    const seatKey = `${req.authProject}|${developer}`;
+    const branchName = sanitizeText(branch || 'main', BRANCH_MAX);
+    developers.set(seatKey, { name: developer, project: req.authProject, status: 'active', workingOn: sanitizeText(workingOn || '', WORKING_ON_MAX), branch: branchName, filesEditing: [], lastSeen: new Date().toISOString(), lastAction: 'Checked in' });
+    capDevelopers(req.authProject, seatKey);
+    addActivity(developer, 'checkin', null, `${developer} checked in on branch ${branchName}`, req.authProject);
     const otherDevelopers = [...developers.values()].filter((d) => d.project === req.authProject && d.name !== developer);
     const pendingAlerts = alerts.filter((a) => (a.to === developer || a.to === seatBase(developer)) && !a.acknowledged && a.project === req.authProject);
     if (pendingAlerts.length) { for (const a of pendingAlerts) a.acknowledged = true; saveState(); }
@@ -513,7 +640,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   });
   app.get('/api/status', (req, res) => {
     cleanExpiredLocks();
-    const connections = {};
+    const connections = Object.create(null);
     for (const [ws, info] of wsClients) if (ws.readyState === 1 && inScope(req, info.project)) connections[info.developer] = (connections[info.developer] || 0) + 1;
     res.json({
       online: onlineNames((info) => inScope(req, info.project)),
@@ -545,7 +672,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   });
   app.get('/api/projects/:id/roster', (req, res) => {
     const pid = req.params.id;
-    const p = registry.projects[pid];
+    const p = projectOf(pid);
     if (!p) return res.status(404).json({ success: false, error: 'unknown project' });
     if (!inScope(req, pid)) return res.status(403).json({ success: false, error: 'forbidden' });
     const bots = p.assertableBots || [];
@@ -554,9 +681,11 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   });
 
   // ─── File locks and the pre-edit check ───
+  const badFile = (file) => typeof file !== 'string' || file.length > FILE_PATH_MAX;
   app.post('/api/lock', (req, res) => {
     const { developer, file, reason } = req.body || {};
     if (!developer || !file) return res.status(400).json({ error: 'developer and file required' });
+    if (badFile(file)) return res.status(400).json({ error: 'invalid_file' });
     cleanExpiredLocks();
     const normalized = lockPath(req.authProject, file);
     const k = lockId(req.authProject, normalized);
@@ -564,14 +693,18 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     if (existing && existing.developer !== developer) {
       return res.json({ ok: false, conflict: true, lockedBy: existing.developer, reason: existing.reason, lockedAt: existing.lockedAt, expiresAt: existing.expiresAt });
     }
-    locks.set(k, { file: normalized, project: req.authProject, developer, reason: reason || '', lockedAt: new Date().toISOString(), expiresAt: Date.now() + LOCK_EXPIRE_MS });
+    if (!existing && [...locks.values()].filter((l) => l.project === req.authProject).length >= LOCK_MAX) {
+      return res.status(429).json({ ok: false, error: 'too_many_locks', message: `This project already holds ${LOCK_MAX} locks; release some first.` });
+    }
+    locks.set(k, { file: normalized, project: req.authProject, developer, reason: sanitizeText(reason || '', REASON_MAX), lockedAt: new Date().toISOString(), expiresAt: Date.now() + LOCK_EXPIRE_MS });
     if (!saveState()) { if (existing) locks.set(k, existing); else locks.delete(k); return res.status(503).json({ ok: false, error: 'persist_failed' }); }
-    addActivity(developer, 'lock', normalized, `${developer} locked ${normalized}: ${reason || 'editing'}`, req.authProject);
+    addActivity(developer, 'lock', normalized, `${developer} locked ${normalized}: ${sanitizeText(reason || 'editing', REASON_MAX)}`, req.authProject);
     res.json({ ok: true });
   });
   app.delete('/api/lock', (req, res) => {
     const { developer, file } = req.body || {};
     if (!developer || !file) return res.status(400).json({ error: 'developer and file required' });
+    if (badFile(file)) return res.status(400).json({ error: 'invalid_file' });
     const normalized = lockPath(req.authProject, file);
     const k = lockId(req.authProject, normalized);
     const existing = locks.get(k);
@@ -586,6 +719,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   app.post('/api/will-edit', (req, res) => {
     const { developer, file } = req.body || {};
     if (!developer || !file) return res.status(400).json({ error: 'developer and file required' });
+    if (badFile(file)) return res.status(400).json({ error: 'invalid_file' });
     cleanExpiredLocks();
     const normalized = lockPath(req.authProject, file);
     const lock = locks.get(lockId(req.authProject, normalized));
@@ -595,13 +729,14 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     // Point-to-one advisory: strictly this project, no super-scope widening.
     const recent = activity.find((a) => a.file && sameFile(req.authProject, a.file, normalized) && a.developer !== developer && a.project === req.authProject && (a.action === 'edit' || a.action === 'create') && Date.now() - new Date(a.timestamp).getTime() < RECENT_EDIT_WARNING_MS);
     if (recent) return res.json({ safe: true, severity: 'warning', message: `WARNING: ${normalized} was edited by ${recent.developer} ${timeSince(recent.timestamp)} ago.` });
-    const shared = registry.projects[req.authProject]?.sharedFiles || [];
+    const shared = projectOf(req.authProject)?.sharedFiles || [];
     if (shared.some((x) => sameFile(req.authProject, lockPath(req.authProject, x), normalized))) return res.json({ safe: true, severity: 'caution', message: `CAUTION: ${normalized} is a shared file. Coordinate with the other sessions.` });
     res.json({ safe: true, severity: 'none' });
   });
   app.post('/api/did-edit', (req, res) => {
     const { developer, file, summary } = req.body || {};
     if (!developer || !file) return res.status(400).json({ error: 'developer and file required' });
+    if (badFile(file)) return res.status(400).json({ error: 'invalid_file' });
     const normalized = lockPath(req.authProject, file);
     const d = developers.get(`${req.authProject}|${developer}`);
     if (d) {
@@ -609,7 +744,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
       d.lastAction = `Edited ${normalized}`;
       if (!d.filesEditing.some((x) => sameFile(req.authProject, x, normalized))) { d.filesEditing.push(normalized); if (d.filesEditing.length > 10) d.filesEditing.shift(); }
     }
-    addActivity(developer, 'edit', normalized, summary || `${developer} edited ${normalized}`, req.authProject);
+    addActivity(developer, 'edit', normalized, summary ? sanitizeText(summary, REASON_MAX) : `${developer} edited ${normalized}`, req.authProject);
     res.json({ ok: true });
   });
 
@@ -624,10 +759,12 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const { from, to, message, priority } = req.body || {};
     const fromActor = actorOf(req, 'from');
     if (!fromActor || !to || !message) return res.status(400).json({ error: 'from, to, and message required' });
+    if (String(to).length > ACTOR_MAX) return res.status(400).json({ error: 'invalid_to', message: `"to" is a seat or bot name of at most ${ACTOR_MAX} characters` });
     const alert = { id: `alert-${++alertIdCounter}`, from: fromActor, to: String(to), message: sanitizeText(message, CONTENT_MAX), priority: PRIORITIES.has(priority) || priority === 'warning' || priority === 'critical' ? priority : 'info', project: req.authProject, timestamp: new Date().toISOString(), acknowledged: false };
     alerts.push(alert);
     addActivity(fromActor, 'alert', null, `${fromActor} → ${to}: ${alert.message}`, req.authProject);
     if (deliverAlertWs(alert)) alert.acknowledged = true;
+    capAlerts(req.authProject);
     saveState();
     res.json({ ok: true, alertId: alert.id });
   });
@@ -648,6 +785,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const fromActor = actorOf(req, 'sender');
     if (!fromActor || !channel || !content) return res.status(400).json({ error: 'sender, channel, and content required' });
     if (!knownChannel(channel)) return res.status(400).json({ error: 'unknown_channel', message: `Unknown channel "${channel}". Valid: ${[...CHANNELS].join(', ')}` });
+    if (boundedMeta(meta) === null) return res.status(400).json({ error: 'meta_too_large', message: `meta is at most ${META_MAX} characters of JSON` });
     const msg = sendToChannel(channel, fromActor, content, meta, req.authProject);
     flushDigestFor(req.authProject, fromActor);
     res.json({ ok: true, id: msg.id });
@@ -656,6 +794,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const { content, meta } = req.body || {};
     const fromActor = actorOf(req, 'sender');
     if (!fromActor || !content) return res.status(400).json({ error: 'sender and content required' });
+    if (boundedMeta(meta) === null) return res.status(400).json({ error: 'meta_too_large', message: `meta is at most ${META_MAX} characters of JSON` });
     const msg = sendToChannel('all', fromActor, content, meta, req.authProject);
     res.json({ ok: true, id: msg.id });
   });
@@ -663,6 +802,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const { seat, reason } = req.body || {};
     const fromActor = actorOf(req, 'sender');
     if (!fromActor || !seat) return res.status(400).json({ error: 'sender and seat required' });
+    if (String(seat).length > ACTOR_MAX) return res.status(400).json({ error: 'invalid_seat', message: `seat is a seat or bot name of at most ${ACTOR_MAX} characters` });
     const { recipients } = sendDirect(fromActor, String(seat), `⏰ WAKE from ${fromActor}: ${sanitizeText(String(reason || 'attention needed'), CONTENT_MAX)}`, 'wake', req.authProject);
     flushDigestFor(req.authProject, String(seat));
     addActivity(fromActor, 'wake', null, `${fromActor} woke ${seat}: ${String(reason || '').slice(0, 60)}`, req.authProject);
@@ -672,11 +812,12 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const { to, content, source } = req.body || {};
     const fromActor = actorOf(req, 'from');
     if (!fromActor || !to || !content) return res.status(400).json({ error: 'from, to, and content required' });
+    if (String(to).length > ACTOR_MAX) return res.status(400).json({ error: 'invalid_to', message: `"to" is a seat, bot or person name of at most ${ACTOR_MAX} characters` });
     const { msg, recipients } = sendDirect(fromActor, String(to), content, typeof source === 'string' ? source.slice(0, 32) : undefined, req.authProject);
     // A person holds no seat: a direct message to one waits on the dashboard.
     const humanTo = humanNameFor(req.authProject, to);
     if (humanTo) noteForPeople(req.authProject, { kind: 'dm', to: humanTo, sender: msg.sender, message: msg.content, priority: 'info' });
-    const receipt = safeDirectReceipt(() => ({ to, from: fromActor, recipients, humanTo, rosterBots: registry.projects[req.authProject]?.assertableBots || [], fleet: [], knownChannels: CHANNELS, seatBase }),
+    const receipt = safeDirectReceipt(() => ({ to, from: fromActor, recipients, humanTo, rosterBots: projectOf(req.authProject)?.assertableBots || [], fleet: [], knownChannels: CHANNELS, seatBase }),
       { warn: (err) => log(`[synapse] direct receipt skipped: ${err && err.message}`) });
     res.json({ ok: true, id: msg.id, ...receipt });
   });
@@ -695,7 +836,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
       const headId = scoped.length ? scoped[0].id : null;
       const cursorN = numericId(req.query.since_id);
       if (cursorN === null) return res.json({ kind: 'resync_required', resync_required: true, project: req.authProject, head_id: headId, gap: scoped.length, reason: 'cursor_missing' });
-      const replayCap = Number.isFinite(registry.projects[req.authProject]?.replayCap) ? registry.projects[req.authProject].replayCap : MESSAGE_HISTORY_MAX;
+      const replayCap = Number.isFinite(projectOf(req.authProject)?.replayCap) ? projectOf(req.authProject).replayCap : MESSAGE_HISTORY_MAX;
       const evictedPast = cursorN < (evictedMax[req.authProject] || 0);
       const newer = scoped.filter((m) => (numericId(m.id) ?? -1) > cursorN).sort((a, b) => numericId(a.id) - numericId(b.id));
       const tooOld = newer.length && Date.now() - new Date(newer[0].timestamp).getTime() > REPLAY_TIME_BOUND_MS;
@@ -707,15 +848,17 @@ export async function createBus({ home, env = process.env, port, host, log = (li
       if (cfg) {
         const humans = projectHumansLower(req.authProject);
         deliverNow = [];
+        const withheld = [];
         for (const m of newer) {
-          if (classifyDelivery(m, replayDev, cfg, { seatBase, humans }) === 'digest') digestStore.push(req.authProject, replayDev, { id: m.id, channel: m.channel, sender: m.sender, content: m.content, timestamp: m.timestamp });
+          if (classifyDelivery(m, replayDev, cfg, { seatBase, humans }) === 'digest') withheld.push({ id: m.id, channel: m.channel, sender: m.sender, content: m.content, timestamp: m.timestamp });
           else deliverNow.push(m);
         }
+        digestStore.pushMany(req.authProject, replayDev, withheld); // one store write per replay, not one per message
       }
       return res.json({ messages: deliverNow, cursor: headId });
     }
     const requestedProject = req.humanPrincipal && typeof req.query.project === 'string' && req.query.project ? req.query.project : undefined;
-    if (requestedProject && !registry.projects[requestedProject]) return res.status(400).json({ error: 'unknown_project' });
+    if (requestedProject && !projectOf(requestedProject)) return res.status(400).json({ error: 'unknown_project' });
     if (requestedProject && !inScope(req, requestedProject)) return res.status(403).json({ error: 'forbidden' });
     let msgs = messageHistory.filter((m) => inScope(req, m.project) && (!requestedProject || m.project === requestedProject) && channelMatch(m));
     // Direct messages are seat-private and filtered here, not by the client. A key sees only the DMs of the identity it
@@ -738,8 +881,12 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   app.post('/api/message/file', multipartBoundary(upload.single('file')), (req, res) => {
     if (auth.rejectForgedActor(req)) { discard(req); return forged(res); }
     if (!req.file) return res.status(400).json({ error: 'No file attached' });
+    if (String(req.file.originalname || '').length > FILENAME_MAX) { discard(req); return res.status(400).json({ error: 'filename_too_long' }); }
     const { channel, content } = req.body || {};
-    const sender = actorOf(req, 'sender') || 'dashboard';
+    // The sender is the signed-in person or a name this key may assert (checked above); never a fallback name, so an
+    // upload can never appear under a reserved name such as 'dashboard'.
+    const sender = actorOf(req, 'sender');
+    if (!sender) { discard(req); return res.status(400).json({ error: 'sender_required' }); }
     const ch = channel || 'code';
     if (!knownChannel(ch)) { discard(req); return res.status(400).json({ error: 'unknown_channel' }); }
     let stored = null;
@@ -752,6 +899,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
       // The pack mirrors the announcement (the file name, never the file) without waiting, so its outcome is unknown here.
       res.json({ ok: true, id: msg.id, fileId: stored.id, tier: stored.tier, relay: humanChannel.name === 'dashboard' ? 'disabled' : 'unconfirmed' });
     } catch (err) {
+      if (err && err.code === 'OVER_BUDGET' && !stored) return res.status(413).json({ ok: false, stored: false, error: 'over_project_budget' });
       log(`[synapse] file upload failed: ${err.message}`);
       res.status(500).json(stored ? { ok: false, stored: true, fileId: stored.id, error: 'post_failed' } : { ok: false, stored: false, error: 'store_failed' });
     } finally { discard(req); }
@@ -779,7 +927,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
   const taskVisible = (req) => (t) => inScope(req, t.project);
   function invalidBlockedBy(req, blockedBy, selfId = null) {
     if (blockedBy === undefined) return null;
-    if (!Array.isArray(blockedBy) || blockedBy.some((x) => typeof x !== 'string' || !x)) return 'blockedBy must be an array of task ids';
+    if (!Array.isArray(blockedBy) || blockedBy.length > BLOCKED_BY_MAX || blockedBy.some((x) => typeof x !== 'string' || !x || x.length > 64)) return `blockedBy must be an array of at most ${BLOCKED_BY_MAX} task ids`;
     const bad = blockedBy.filter((id) => id === selfId || !tasks.some((t) => t.id === id && taskVisible(req)(t)));
     return bad.length ? `Unknown blockedBy id(s): ${bad.join(', ')}` : null;
   }
@@ -795,11 +943,11 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     if (!title) return res.status(400).json({ error: 'title required' });
     const bbErr = invalidBlockedBy(req, blockedBy);
     if (bbErr) return res.status(400).json({ error: 'invalid_blocked_by', message: bbErr });
-    const task = { id: `task-${++taskIdCounter}`, title: sanitizeText(title, 300), owner: owner || null, status: 'pending', priority: priority || 2, type: type || 'general',
-      description: sanitizeText(description || '', CONTENT_MAX), createdBy: actorOf(req, 'createdBy') || 'dashboard', project: req.authProject, createdAt: new Date().toISOString(), completedAt: null, blockedBy: blockedBy || [], branch: branch || null };
+    const task = { id: `task-${++taskIdCounter}`, title: sanitizeText(title, 300), owner: short(owner, ACTOR_MAX) || null, status: 'pending', priority: short(priority, SHORT_MAX) || 2, type: short(type, SHORT_MAX) || 'general',
+      description: sanitizeText(description || '', CONTENT_MAX), createdBy: actorOf(req, 'createdBy') || principalOf(req), project: req.authProject, createdAt: new Date().toISOString(), completedAt: null, blockedBy: blockedBy || [], branch: short(branch, BRANCH_MAX) || null };
     const before = tasks.slice();
     tasks.push(task);
-    if (tasks.length > TASK_MAX) tasks.splice(0, tasks.length - TASK_MAX);
+    capPerProject(tasks, req.authProject, TASK_MAX, { newestFirst: false });
     if (!saveState()) { tasks.length = 0; tasks.push(...before); taskIdCounter--; return res.status(503).json({ error: 'persist_failed' }); }
     broadcastWs('task_update', { action: 'created', task }, null, req.authProject);
     addActivity(task.createdBy, 'task', null, `Created task: ${task.title}`, req.authProject);
@@ -829,24 +977,25 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const snapshot = { ...task };
     const idx = tasks.indexOf(task);
     const { status, owner, priority, title, description, branch, type, blockedBy } = body;
-    if (status) task.status = status;
-    if (owner !== undefined) task.owner = owner;
-    if (priority) task.priority = priority;
+    if (status) task.status = short(status, SHORT_MAX);
+    if (owner !== undefined) task.owner = short(owner, ACTOR_MAX);
+    if (priority) task.priority = short(priority, SHORT_MAX);
     if (title) task.title = sanitizeText(title, 300);
     if (description !== undefined) task.description = sanitizeText(description, CONTENT_MAX);
-    if (branch !== undefined) task.branch = branch;
-    if (type) task.type = type;
+    if (branch !== undefined) task.branch = short(branch, BRANCH_MAX);
+    if (type) task.type = short(type, SHORT_MAX);
     if (blockedBy !== undefined) task.blockedBy = blockedBy;
     if (status === 'done') task.completedAt = new Date().toISOString();
     if (status === 'in-progress' && !task.startedAt) task.startedAt = new Date().toISOString();
     if (!saveState()) { tasks[idx] = snapshot; return res.status(503).json({ error: 'persist_failed' }); }
     broadcastWs('task_update', { action: 'updated', task }, null, taskProject);
-    // The actor is the bound updatedBy, else the authenticated bot or person, else 'unknown'; never the client's owner.
-    const developer = req.humanPrincipal || body.updatedBy || req.botPrincipal || 'unknown';
+    // The actor is the person, else the bound updatedBy, else the authenticated principal; never the client's owner.
+    const developer = req.humanPrincipal || body.updatedBy || principalOf(req);
     const VERB = { 'in-progress': '▶️ Started', blocked: '⛔ Blocked', review: '👀 Review', done: '✅ Completed' };
-    if (status && VERB[status]) {
-      addActivity(developer, 'task', null, `${VERB[status]}: ${task.title}`, taskProject);
-      sendToChannel('tasks', developer, `${VERB[status]}: ${task.title}`, { type: `task_${status.replace(/-/g, '_')}` }, taskProject);
+    const verb = typeof status === 'string' && Object.hasOwn(VERB, status) ? VERB[status] : null;
+    if (verb) {
+      addActivity(developer, 'task', null, `${verb}: ${task.title}`, taskProject);
+      sendToChannel('tasks', developer, `${verb}: ${task.title}`, { type: `task_${status.replace(/-/g, '_')}` }, taskProject);
     }
     if (status === 'done') unblockDependents(taskProject);
     res.json({ ok: true, task });
@@ -867,7 +1016,7 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const sender = actorOf(req, 'sender');
     if (!sender || !message) return res.status(400).json({ error: 'sender and message required' });
     const pingable = people.pingableFor(req.authProject);
-    const requested = Array.isArray(tag) ? tag : (!tag || tag === 'all') ? pingable.filter((n) => people.isOwner(n)) : [tag];
+    const requested = [...new Set(Array.isArray(tag) ? tag : (!tag || tag === 'all') ? pingable.filter((n) => people.isOwner(n)) : [tag])];
     const unknown = requested.filter((t) => typeof t !== 'string' || !pingable.includes(t));
     if (unknown.length) return res.status(400).json({ error: 'unknown_tag', message: `Unknown tag(s): ${unknown.join(', ')}. Valid: ${[...pingable, 'all'].join(', ')}` });
     const pr = PRIORITIES.has(priority) ? priority : 'info';
@@ -955,11 +1104,11 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const { type, message, file, line, stack, severity } = req.body || {};
     const developer = actorOf(req, 'developer');
     if (!developer || !message) return res.status(400).json({ error: 'developer and message required' });
-    const entry = { id: `err-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`, project: req.authProject, developer, type: type || 'error', message: sanitizeText(message, CONTENT_MAX), file: file || null, line: line || null, stack: stack ? sanitizeText(stack, CONTENT_MAX) : null, severity: severity || 'error', resolved: false, timestamp: new Date().toISOString() };
+    const entry = { id: `err-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`, project: req.authProject, developer, type: short(type, SHORT_MAX) || 'error', message: sanitizeText(message, CONTENT_MAX), file: short(file, FILE_PATH_MAX) || null, line: short(line, SHORT_MAX) || null, stack: stack ? sanitizeText(stack, CONTENT_MAX) : null, severity: short(severity, SHORT_MAX) || 'error', resolved: false, timestamp: new Date().toISOString() };
     errors.unshift(entry);
-    if (errors.length > ERROR_MAX) errors.length = ERROR_MAX;
+    capPerProject(errors, req.authProject, ERROR_MAX, { newestFirst: true });
     broadcastWs('error_report', entry, null, req.authProject);
-    addActivity(developer, 'error', file, `${developer} reported: ${String(message).slice(0, 80)}`, req.authProject);
+    addActivity(developer, 'error', entry.file, `${developer} reported: ${String(message).slice(0, 80)}`, req.authProject);
     res.json({ ok: true, id: entry.id });
   });
   app.get('/api/errors', (req, res) => {
@@ -978,9 +1127,16 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const { lines } = req.body || {};
     const developer = actorOf(req, 'developer');
     if (!developer || !lines) return res.status(400).json({ error: 'developer and lines required' });
-    const buf = (logBuffers[developer] ||= []);
+    const bufKey = `${req.authProject}|${developer}`;
+    if (!logBuffers.has(bufKey)) {
+      // At most DEVELOPER_MAX buffers per project: the one created first goes.
+      const mine = [...logBuffers.entries()].filter(([, b]) => b.project === req.authProject);
+      if (mine.length >= DEVELOPER_MAX) logBuffers.delete(mine[0][0]);
+      logBuffers.set(bufKey, { developer, project: req.authProject, rows: [] });
+    }
+    const buf = logBuffers.get(bufKey).rows;
     for (const entry of Array.isArray(lines) ? lines : [{ line: lines, level: 'info' }]) {
-      const row = { developer, project: req.authProject, line: sanitizeText(String(entry && entry.line !== undefined ? entry.line : entry), CONTENT_MAX), level: (entry && entry.level) || 'info', ts: new Date().toISOString() };
+      const row = { developer, project: req.authProject, line: sanitizeText(String(entry && entry.line !== undefined ? entry.line : entry), CONTENT_MAX), level: short(entry && entry.level, SHORT_MAX) || 'info', ts: new Date().toISOString() };
       buf.push(row);
       if (buf.length > LOG_BUFFER_MAX) buf.shift();
       broadcastWs('log_line', row, null, req.authProject);
@@ -988,8 +1144,8 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     res.json({ ok: true, buffered: buf.length });
   });
   app.get('/api/logs', (req, res) => {
-    const all = {};
-    for (const [dev, buf] of Object.entries(logBuffers)) { const v = buf.filter(scopeFilter(req)); if (v.length) all[dev] = v.slice(-20); }
+    const all = Object.create(null);
+    for (const { developer, rows } of logBuffers.values()) { const v = rows.filter(scopeFilter(req)); if (v.length) all[developer] = [...(all[developer] || []), ...v.slice(-20)]; }
     res.json({ logs: all });
   });
 
@@ -1013,9 +1169,9 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     if (url.searchParams.has('key') || typeof key !== 'string' || !key || key.includes(',')) { ws.close(4001, 'Invalid API key'); return; }
     const developer = url.searchParams.get('developer') || 'unknown';
     const project = url.searchParams.get('project') || DEFAULT_PROJECT;
-    if (!project || !registry.projects[project]) { ws.close(4002, 'Unknown project'); return; }
+    if (!projectOf(project)) { ws.close(4002, 'Unknown project'); return; }
     const botPrincipal = auth.matchBotKey(project, key);
-    if (!botPrincipal && !safeEqual(key, auth.projectKey(project) || '')) { ws.close(4001, 'Invalid API key'); return; }
+    if (!botPrincipal && !safeEqual(key, auth.projectKey(project))) { ws.close(4001, 'Invalid API key'); return; }
     if (!auth.bindIdentity(project, developer, { authProject: project, botPrincipal, headers: { 'x-dev-key': key } })) { ws.close(4003, 'Identity not in project roster'); return; }
     const channels = (url.searchParams.get('channels') || 'all').split(',').filter(Boolean);
     const effort = (url.searchParams.get('effort') || 'unknown').slice(0, 32);
@@ -1026,8 +1182,8 @@ export async function createBus({ home, env = process.env, port, host, log = (li
     const k = `${project}|${developer}`;
     const now = new Date().toISOString();
     if (developers.has(k)) Object.assign(developers.get(k), { status: 'active', lastSeen: now, effort, model });
-    else developers.set(k, { name: developer, project, status: 'active', workingOn: '', branch: 'main', filesEditing: [], lastSeen: now, lastAction: 'Connected', effort, model });
-    const botMeta = {};
+    else { developers.set(k, { name: developer, project, status: 'active', workingOn: '', branch: 'main', filesEditing: [], lastSeen: now, lastAction: 'Connected', effort, model }); capDevelopers(project, k); }
+    const botMeta = Object.create(null);
     for (const [, i] of wsClients) if (i.project === project) botMeta[i.developer] = { effort: i.effort, model: i.model };
     ws.send(JSON.stringify({ event: 'connected', developer, channels, project, caps: [], onlineBots: onlineNames((i) => i.project === project), botMeta, timestamp: now }));
     broadcastWs('bot_meta', { developer, effort, model }, developer, project);
@@ -1038,7 +1194,9 @@ export async function createBus({ home, env = process.env, port, host, log = (li
       if (rec) { rec.status = 'active'; rec.lastSeen = new Date().toISOString(); }
       if (!data || typeof data !== 'object') return;
       if (data.event === 'message' && typeof data.content === 'string' && data.content) {
-        if (data.to) sendDirect(developer, String(data.to), data.content, undefined, project);
+        if (data.to && String(data.to).length > ACTOR_MAX) { if (ws.readyState === 1) ws.send(JSON.stringify({ event: 'error', error: 'invalid_to' })); }
+        else if (data.to) sendDirect(developer, String(data.to), data.content, undefined, project);
+        else if (boundedMeta(data.meta) === null) { if (ws.readyState === 1) ws.send(JSON.stringify({ event: 'error', error: 'meta_too_large' })); }
         else if (knownChannel(data.channel || 'code')) sendToChannel(data.channel || 'code', developer, data.content, data.meta, project);
         else if (ws.readyState === 1) ws.send(JSON.stringify({ event: 'error', error: 'unknown_channel' }));
       } else if (data.event === 'heartbeat') {

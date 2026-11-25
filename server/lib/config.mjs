@@ -10,12 +10,17 @@ export const RESERVED_CHANNELS = ['all', 'direct'];
 export const PROJECT_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 export const BOT_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 export const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+// Names the bus itself posts as (besides the configured system sender). No bot or person may take one, and no client may
+// assert one, so a message under one of these names always came from the bus.
+export const RESERVED_NAMES = Object.freeze(['dashboard', 'unknown', 'ask-bridge']);
 export const MIN_KEY_LENGTH = 24;
 // Discord ids (users, channels) are snowflakes: 17 to 20 digits.
 export const DISCORD_ID_RE = /^\d{17,20}$/;
 export const DEFAULT_DISCORD_TOKEN_ENV = 'SYNAPSE_DISCORD_TOKEN';
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+// A registry or people table read by name: own properties only, so "constructor" or "__proto__" is never an entry.
+const hasEntry = (obj, k) => isObj(obj) && typeof k === 'string' && Object.hasOwn(obj, k);
 const fatal = (message) => ({ level: 'fatal', message });
 const warn = (message) => ({ level: 'warn', message });
 
@@ -59,6 +64,7 @@ export function checkConfig(config) {
     const discordOn = isObj(config.discord) && config.discord.enabled === true; // a bad Discord id stops the boot only when the pack is on
     for (const [name, p] of Object.entries(people)) {
       if (!NAME_RE.test(name)) f.push(fatal(`person "${name}": names are lowercase letters, digits, "_" or "-", starting with a letter, at most 32`));
+      if (RESERVED_NAMES.includes(name) || name === (typeof config.systemSender === 'string' && config.systemSender ? config.systemSender : 'synapse')) f.push(fatal(`person "${name}": the name is reserved for the bus's own messages`));
       if (!isObj(p)) { f.push(fatal(`person "${name}" must be an object`)); continue; }
       if (p.roles !== undefined && (!Array.isArray(p.roles) || p.roles.some((r) => !ROLES.includes(r)))) f.push(fatal(`person "${name}": roles must be a list of ${ROLES.join(', ')}`));
       if (p.projects !== undefined && (!Array.isArray(p.projects) || p.projects.some((x) => typeof x !== 'string'))) f.push(fatal(`person "${name}": projects must be a list of project ids or "*"`));
@@ -78,8 +84,8 @@ export function checkConfig(config) {
     }
   }
   if (!Array.isArray(config.owners) || config.owners.length === 0) f.push(fatal('"owners" must list at least one person: owners decide cards, and an unknown person is always refused'));
-  else for (const o of config.owners) if (!isObj(people) || !Object.prototype.hasOwnProperty.call(people, o)) f.push(fatal(`owner "${o}" is not in "people"`));
-  if (isObj(people) && Array.isArray(config.owners) && config.owners.length && !config.owners.some((o) => people[o] && people[o].keyHash)) {
+  else for (const o of config.owners) if (!hasEntry(people, o)) f.push(fatal(`owner "${o}" is not in "people"`));
+  if (isObj(people) && Array.isArray(config.owners) && config.owners.length && !config.owners.some((o) => hasEntry(people, o) && people[o] && people[o].keyHash)) {
     f.push(warn('no owner has a key yet (run "synapse set-human-key <name>" in your own terminal); until one does, nobody can answer a card on the dashboard'));
   }
   if (config.channels !== undefined) {
@@ -123,6 +129,7 @@ export function checkRegistry(registry, config, env = process.env) {
       if (typeof b !== 'string' || !BOT_RE.test(b)) f.push(fatal(`project "${id}": bot name "${b}" is not valid`));
       if (people.includes(b)) f.push(fatal(`project "${id}": bot "${b}" has the same name as a person; a bot must never be able to post as a person`));
       if (b === systemSender) f.push(fatal(`project "${id}": bot "${b}" uses the system sender name`));
+      if (RESERVED_NAMES.includes(b)) f.push(fatal(`project "${id}": bot "${b}" uses a name reserved for the bus's own messages`));
     }
     for (const [bot, r] of Object.entries(isObj(p.roster) ? p.roster : {})) if (isObj(r) && r.keyEnv) noteKey(r.keyEnv, `project "${id}" bot "${bot}"`);
     if (p.sharedFiles !== undefined && (!Array.isArray(p.sharedFiles) || p.sharedFiles.some((s) => typeof s !== 'string'))) f.push(fatal(`project "${id}": sharedFiles must be a list of paths`));
@@ -130,10 +137,10 @@ export function checkRegistry(registry, config, env = process.env) {
   // Cross-project service keys ("super-scopes") are not part of this release: every key belongs to one project.
   if (isObj(registry.superScopes) && Object.keys(registry.superScopes).length) f.push(fatal('projects.json: "superScopes" are not supported in this version; remove them (people read across their projects with their personal key)'));
   if (config) {
-    if (config.defaultProject !== undefined && !registry.projects[config.defaultProject]) f.push(fatal(`defaultProject "${config.defaultProject}" is not in projects.json`));
-    if (config.adminProject !== undefined && !registry.projects[config.adminProject]) f.push(fatal(`adminProject "${config.adminProject}" is not in projects.json`));
+    if (config.defaultProject !== undefined && !hasEntry(registry.projects, config.defaultProject)) f.push(fatal(`defaultProject "${config.defaultProject}" is not in projects.json`));
+    if (config.adminProject !== undefined && !hasEntry(registry.projects, config.adminProject)) f.push(fatal(`adminProject "${config.adminProject}" is not in projects.json`));
     for (const [name, p] of Object.entries(isObj(config.people) ? config.people : {})) {
-      for (const pr of (isObj(p) && Array.isArray(p.projects) ? p.projects : [])) if (pr !== '*' && !registry.projects[pr]) f.push(warn(`person "${name}": project "${pr}" is not in projects.json`));
+      for (const pr of (isObj(p) && Array.isArray(p.projects) ? p.projects : [])) if (pr !== '*' && !hasEntry(registry.projects, pr)) f.push(warn(`person "${name}": project "${pr}" is not in projects.json`));
     }
   }
   return f;
@@ -194,7 +201,7 @@ export function checkDiscord(config, registry, env = process.env) {
   let mapped = 0;
   if (d.projects !== undefined && !isObj(d.projects)) f.push(bad('"discord.projects" must be an object of project id -> { channels, cards }'));
   for (const [project, p] of Object.entries(isObj(d.projects) ? d.projects : {})) {
-    if (registry && isObj(registry.projects) && !registry.projects[project]) f.push(bad(`discord.projects: project "${project}" is not in projects.json`));
+    if (registry && isObj(registry.projects) && !hasEntry(registry.projects, project)) f.push(bad(`discord.projects: project "${project}" is not in projects.json`));
     if (!isObj(p)) { f.push(bad(`discord.projects.${project} must be an object`)); continue; }
     for (const k of Object.keys(p)) if (!['channels', 'cards'].includes(k)) f.push(bad(`discord.projects.${project}: unknown field "${k}" (known: channels, cards)`));
     if (p.channels !== undefined && !isObj(p.channels)) { f.push(bad(`discord.projects.${project}.channels must be an object of bus channel -> Discord channel id`)); continue; }

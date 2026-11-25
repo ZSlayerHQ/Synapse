@@ -1,6 +1,7 @@
-// How the client finds its home, bus and key: SYNAPSE_HOME or the installed layout or ~/.synapse; <home>/.env fills only unset
-// variables; --url beats DEV_SYNC_URL beats synapse.config.json; the key only from the variable --key-env names, sent only in
-// X-Dev-Key. Child processes get a pinned environment (DEV_SYNC_SEAT, SYNAPSE_HOME) and talk only to a mock bus.
+// How the client finds its home, bus and key: the installed layout, else SYNAPSE_HOME, else ~/.synapse; <home>/.env fills
+// only unset variables; the bus only from synapse.config.json (--url, --http and DEV_SYNC_URL are ignored); the key only
+// from the variable the home registry binds to the project registered at the working folder, sent only in X-Dev-Key.
+// Child processes get a pinned environment (DEV_SYNC_SEAT, SYNAPSE_HOME) and talk only to a mock bus.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -9,7 +10,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { spawnSync, spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { pinEnv, childEnv, tempHome, listenInRange, closeServer, CLIENT_INDEX } from './helpers.mjs';
+import { pinEnv, childEnv, tempHome, bindHome, answerBusProof, listenInRange, closeServer, CLIENT_INDEX } from './helpers.mjs';
 
 pinEnv();
 const { resolveHome, wsUrlFromConfig, httpFromWs, parseEnvText, DEFAULT_PORT } = await import('../../client/index.js');
@@ -19,18 +20,18 @@ const runnerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'synapse-client-runner-'
 const RUNNER = path.join(runnerDir, 'print-config.mjs');
 fs.writeFileSync(RUNNER, [
   `const m = await import(${JSON.stringify(pathToFileURL(CLIENT_INDEX).href)});`,
-  'const out = { ws: m.WS_URL, http: m.HTTP_URL, developer: m.DEVELOPER, project: m.PROJECT, home: m.SYNAPSE_HOME, keyEnv: m.KEY_ENV };',
+  'const out = { ws: m.WS_URL, http: m.HTTP_URL, developer: m.DEVELOPER, project: m.PROJECT, home: m.SYNAPSE_HOME, keyEnv: m.KEY_ENV, refused: m.BINDING.refused };',
   "if (process.env.CALL_TOOL) out.result = await m.handleToolCall({ params: { name: process.env.CALL_TOOL, arguments: {} } });",
   'process.stdout.write(JSON.stringify(out));',
 ].join('\n'));
 
-const run = (args = [], env = {}) => {
-  const r = spawnSync(process.execPath, [RUNNER, ...args], { env: childEnv({ SYNAPSE_MCP_IMPORT_ONLY: '1', ...env }), encoding: 'utf8', timeout: 15000 });
+const run = (args = [], env = {}, { cwd } = {}) => {
+  const r = spawnSync(process.execPath, [RUNNER, ...args], { cwd, env: childEnv({ SYNAPSE_MCP_IMPORT_ONLY: '1', ...env }), encoding: 'utf8', timeout: 15000 });
   assert.equal(r.status, 0, r.stderr);
   return { ...JSON.parse(r.stdout), stderr: r.stderr };
 };
-const runAsync = (args = [], env = {}) => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, [RUNNER, ...args], { env: childEnv({ SYNAPSE_MCP_IMPORT_ONLY: '1', ...env }) });
+const runAsync = (args = [], env = {}, { cwd } = {}) => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [RUNNER, ...args], { cwd, env: childEnv({ SYNAPSE_MCP_IMPORT_ONLY: '1', ...env }) });
   let out = ''; let err = '';
   child.stdout.on('data', (c) => { out += c; });
   child.stderr.on('data', (c) => { err += c; });
@@ -46,6 +47,7 @@ const homeWith = ({ config, env } = {}) => {
 
 const keys = [];
 const server = http.createServer((req, res) => {
+  if (answerBusProof(req, res)) return;
   keys.push({ key: req.headers['x-dev-key'], url: req.url });
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end('{"locks":[]}');
@@ -70,7 +72,7 @@ test('pure: the HTTP base is the WebSocket URL with its scheme swapped and the t
   assert.equal(httpFromWs('ws://host:4600/prefix/ws/'), 'http://host:4600/prefix');
 });
 
-test('pure: the home is SYNAPSE_HOME, else the installed layout when it holds synapse.config.json, else ~/.synapse', () => {
+test('pure: the home is the installed layout when it holds synapse.config.json, else SYNAPSE_HOME, else ~/.synapse', () => {
   const root = tempHome('synapse-client-layout-');
   const clientDir = path.join(root, 'app', 'client');
   fs.mkdirSync(clientDir, { recursive: true });
@@ -78,7 +80,9 @@ test('pure: the home is SYNAPSE_HOME, else the installed layout when it holds sy
   assert.equal(resolveHome({ env: {}, clientDir, homedir: fakeHome }), path.join(fakeHome, '.synapse'), 'no config two levels up');
   fs.writeFileSync(path.join(root, 'synapse.config.json'), '{}');
   assert.equal(resolveHome({ env: {}, clientDir, homedir: fakeHome }), root, 'the installed layout');
-  assert.equal(resolveHome({ env: { SYNAPSE_HOME: path.join(root, 'elsewhere') }, clientDir, homedir: fakeHome }), path.join(root, 'elsewhere'), 'SYNAPSE_HOME wins');
+  assert.equal(resolveHome({ env: { SYNAPSE_HOME: path.join(root, 'elsewhere') }, clientDir, homedir: fakeHome }), root, 'an installed client ignores SYNAPSE_HOME, which a project .mcp.json can set');
+  const source = path.join(root, 'src', 'client');
+  assert.equal(resolveHome({ env: { SYNAPSE_HOME: path.join(root, 'elsewhere') }, clientDir: source, homedir: fakeHome }), path.join(root, 'elsewhere'), 'a source checkout uses SYNAPSE_HOME');
 });
 
 test('pure: .env lines are KEY=VALUE; comments, blanks and malformed lines are skipped; one layer of quotes comes off', () => {
@@ -105,10 +109,17 @@ test('an explicit environment beats <home>/.env; --developer and --project still
   assert.equal(run(['--project', 'argp'], { SYNAPSE_HOME: homeWith(), DEV_SYNC_PROJECT: 'envp' }).project, 'argp', 'the argument beats DEV_SYNC_PROJECT');
 });
 
-test('--url beats DEV_SYNC_URL, which beats the config; with nothing set the default 127.0.0.1:4560', () => {
+test('only the home config names the bus: DEV_SYNC_URL is ignored with a note, --url and --http refuse; the default is 127.0.0.1:4560', () => {
   const home = homeWith({ config: { server: { host: 'cfg.lan', port: 4801 } } });
-  assert.equal(run([], { SYNAPSE_HOME: home, DEV_SYNC_URL: 'ws://env.lan:4802/ws' }).ws, 'ws://env.lan:4802/ws');
-  assert.equal(run(['--url', 'ws://arg.lan:4803/ws'], { SYNAPSE_HOME: home, DEV_SYNC_URL: 'ws://env.lan:4802/ws' }).ws, 'ws://arg.lan:4803/ws');
+  const out = run([], { SYNAPSE_HOME: home, DEV_SYNC_URL: 'ws://env.lan:4802/ws' });
+  assert.equal(out.ws, 'ws://cfg.lan:4801/ws');
+  assert.equal(out.http, 'http://cfg.lan:4801');
+  assert.match(out.stderr, /DEV_SYNC_URL was ignored/);
+  for (const flag of [['--url', 'ws://arg.lan:4803/ws'], ['--http', 'http://arg.lan:4803']]) {
+    const r = run(flag, { SYNAPSE_HOME: home });
+    assert.equal(r.ws, 'ws://cfg.lan:4801/ws', flag[0]);
+    assert.match(r.refused, new RegExp(`${flag[0]} names a bus address`));
+  }
   const none = run([], { SYNAPSE_HOME: homeWith() });
   assert.equal(none.ws, 'ws://127.0.0.1:4560/ws');
   assert.equal(none.http, 'http://127.0.0.1:4560');
@@ -124,21 +135,31 @@ test('seat suffix rules: a named seat is cleaned, auto is the pid, a dotted deve
   assert.equal(run([], {}).developer, 'unknown');
 });
 
-test('the key comes from DEV_SYNC_KEY (or <home>/.env), and only travels in X-Dev-Key', async () => {
-  const url = `ws://127.0.0.1:${port}/ws`;
+// A project folder registered in a fresh home, with the mock bus in its config.
+const boundProject = ({ keyEnv = 'MY_BUS_KEY', env } = {}) => {
+  const dir = tempHome('synapse-client-proj-');
+  const home = bindHome(homeWith({ env }), { port, project: 'proj1', keyEnv, root: dir });
+  return { dir, home };
+};
+
+test('the key comes from the variable the registry binds (or <home>/.env), and only travels in X-Dev-Key', async () => {
   keys.length = 0;
-  await runAsync(['--url', url], { DEV_SYNC_KEY: 'env-key', CALL_TOOL: 'dev_sync_locks' });
-  await runAsync(['--url', url], { SYNAPSE_HOME: homeWith({ env: 'DEV_SYNC_KEY=file-key\n' }), CALL_TOOL: 'dev_sync_locks' });
+  const a = boundProject();
+  const env = await runAsync([], { SYNAPSE_HOME: a.home, MY_BUS_KEY: 'env-key', DEV_SYNC_KEY: 'other', CALL_TOOL: 'dev_sync_locks' }, { cwd: a.dir });
+  assert.equal(env.keyEnv, 'MY_BUS_KEY');
+  assert.equal(env.project, 'proj1', 'the project registered at the working folder');
+  const b = boundProject({ env: 'MY_BUS_KEY=file-key\n' });
+  await runAsync([], { SYNAPSE_HOME: b.home, CALL_TOOL: 'dev_sync_locks' }, { cwd: path.join(b.dir) });
   assert.deepEqual(keys.map((k) => k.key), ['env-key', 'file-key']);
   assert.ok(keys.every((k) => !/key/i.test(k.url)), 'never in the URL');
 });
 
-test('--key-env names the variable; a literal --key is ignored with a warning that does not echo it', async () => {
-  const url = `ws://127.0.0.1:${port}/ws`;
+test('a --key-env the registry binds is accepted; a literal --key is ignored with a warning that does not echo it', async () => {
   keys.length = 0;
-  const named = await runAsync(['--url', url, '--key-env', 'MY_BUS_KEY'], { MY_BUS_KEY: 'named-key', DEV_SYNC_KEY: 'other', CALL_TOOL: 'dev_sync_locks' });
+  const a = boundProject();
+  const named = await runAsync(['--key-env', 'MY_BUS_KEY'], { SYNAPSE_HOME: a.home, MY_BUS_KEY: 'named-key', CALL_TOOL: 'dev_sync_locks' }, { cwd: a.dir });
   assert.equal(named.keyEnv, 'MY_BUS_KEY');
-  const literal = await runAsync(['--url', url, '--key', 'literal-secret-value'], { CALL_TOOL: 'dev_sync_locks' });
+  const literal = await runAsync(['--key', 'literal-secret-value'], { SYNAPSE_HOME: a.home, CALL_TOOL: 'dev_sync_locks' }, { cwd: a.dir });
   assert.deepEqual(keys.map((k) => k.key), ['named-key', ''], 'the literal is never used');
   assert.match(literal.stderr, /--key is not supported and was ignored/);
   assert.doesNotMatch(literal.stderr, /literal-secret-value/);

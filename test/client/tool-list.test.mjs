@@ -3,12 +3,13 @@
 import { test, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { pinEnv, listenInRange, closeServer } from './helpers.mjs';
+import { pinEnv, answerBusProof, listenInRange, closeServer } from './helpers.mjs';
 
 const seen = [];
 const mode = { channels: 'ok', channelsBody: { channels: ['code', 'ops', 'design'] }, tags: { tags: ['pat', 'sam'] } };
 const json = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
 const server = http.createServer((req, res) => {
+  if (answerBusProof(req, res)) return;
   const p = new URL(req.url, 'http://x').pathname;
   seen.push({ method: req.method, path: p, key: req.headers['x-dev-key'] });
   if (p === '/api/channels') {
@@ -23,8 +24,8 @@ const server = http.createServer((req, res) => {
 const port = await listenInRange(server);
 after(() => closeServer(server));
 
-pinEnv({ DEV_SYNC_KEY: 'list-key' });
-process.argv.push('--url', `ws://127.0.0.1:${port}/ws`, '--developer', 'listtest');
+pinEnv({ DEV_SYNC_KEY: 'list-key' }, { port });
+process.argv.push('--developer', 'listtest');
 const { TOOLS, listTools, listingReset, buildTools, parseChannels, DEFAULT_CHANNELS } = await import('../../client/index.js');
 
 const CUT = ['dev_service_list', 'dev_service_status', 'dev_service_restart', 'dev_job_update', 'dev_job_finish', 'dev_session_control', 'dev_bus_status'];

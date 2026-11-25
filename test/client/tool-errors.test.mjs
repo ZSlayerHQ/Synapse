@@ -1,11 +1,12 @@
 // A failed or timed-out bus call reaches the calling agent as an MCP error result (isError: true) through the real tool
-// handlers, not only at the HTTP-helper layer. The client is pointed at a mock server via --url before import.
+// handlers, not only at the HTTP-helper layer. The client is pointed at a mock server by its home config before import.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { pinEnv, listenInRange, closeServer } from './helpers.mjs';
+import { pinEnv, answerBusProof, listenInRange, closeServer } from './helpers.mjs';
 
 const server = http.createServer((req, res) => {
+  if (answerBusProof(req, res)) return;
   const p = new URL(req.url, 'http://x').pathname;
   if (p === '/api/tasks' || p === '/api/message') return; // never answers
   if (p === '/api/locks') { res.writeHead(500, { 'content-type': 'application/json' }); return res.end('{"error":"boom"}'); }
@@ -15,8 +16,8 @@ const server = http.createServer((req, res) => {
 const port = await listenInRange(server);
 after(() => closeServer(server));
 
-pinEnv({ DEV_SYNC_API_TIMEOUT_MS: '200' });
-process.argv.push('--url', `ws://127.0.0.1:${port}/ws`, '--developer', 'toolerrtest');
+pinEnv({ DEV_SYNC_API_TIMEOUT_MS: '200' }, { port });
+process.argv.push('--developer', 'toolerrtest');
 const { handleToolCall } = await import('../../client/index.js');
 const call = (name, args = {}) => Promise.race([
   handleToolCall({ params: { name, arguments: args } }),

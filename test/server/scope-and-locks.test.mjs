@@ -15,7 +15,7 @@ test('health is open and carries no project data', async () => {
   assert.equal(r.status, 200);
   assert.equal(r.body.status, 'healthy');
   assert.deepEqual(r.body.humanChannelStatus, {}, 'the dashboard channel reports no connection state');
-  assert.deepEqual(Object.keys(r.body).sort(), ['busUptime', 'humanChannel', 'humanChannelStatus', 'instance', 'pid', 'status', 'uptime', 'version']);
+  assert.deepEqual(Object.keys(r.body).sort(), ['busUptime', 'humanChannel', 'humanChannelStatus', 'pid', 'status', 'uptime', 'version'], 'no instance: only a bus proof binds it');
 });
 
 test('auth: no key 401, wrong key 401, another project\'s key 401, unknown project 400', async () => {

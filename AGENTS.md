@@ -34,7 +34,8 @@ is down, is not checked.
 
 If you need approvals that an unrestricted agent cannot forge, run the bus and its home under a **separate OS account**
 that the agents cannot read or write, and give the agents' account only the project keys (as environment variables,
-not the home). This setup is optional and not automated here.
+not the home). The hooks there still need a readable `synapse.config.json` and `projects.json` (neither holds a key) at
+the agents' `SYNAPSE_HOME`. This setup is optional and not automated here.
 
 **With the Discord pack on** (step 13), Discord becomes a second way in, and this is who can act through it:
 - Only Discord accounts listed in `synapse.config.json` (`people.<name>.accounts.discord`) count; each maps to exactly
@@ -150,7 +151,8 @@ Next:
 ```
 
 What it wrote, so you can explain it: `.mcp.json` runs the Synapse MCP client with `node` and an absolute path into the
-home (no key in the file); `.synapse/config.json` tells the hooks the project and bot (no key); four hooks in
+home (no key in the file; the client checks its arguments against `projects.json` for this folder); `.synapse/config.json` tells the hooks the project and bot (no key; the hooks use it only
+while `projects.json` registers that project at this folder, see the README's trust model); four hooks in
 `.claude/settings.local.json` (check-in, check-out, the pre-edit lock check, post-edit sync). These hold this machine's
 paths, so by default they stay out of git: `.synapse/`, `.claude/settings.local.json` and an untracked `.mcp.json` get
 anchored lines in the repository's exclude file (the one `git rev-parse --git-path info/exclude` names, not the
@@ -195,7 +197,8 @@ node bin/synapse.mjs doctor --ready
 ```
 
 Expected: every line `ok` (a few `note` lines are fine) and `synapse doctor: all checks passed`. It checks Node,
-`node:sqlite`, the installed app, the config, the key file's permissions, that the bus is up, that it accepts each
+`node:sqlite`, the installed app, the config, the key file's permissions, that the bus is up and proves it holds this
+home's bus secret (no key is sent before that), that it accepts each
 project's key, that an owner has a personal key, and for each project folder the bot's key (it must authenticate as that
 bot, or for the project), the exact MCP entry (type, command, arguments, environment) and each of the four hooks once
 with its type, matcher and script; with Discord on, the token's presence (never its value), that discord.js loads,

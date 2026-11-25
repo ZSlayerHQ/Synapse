@@ -1,5 +1,5 @@
 // dev_get_file saves files the agent cannot see inline: agents never read keys, so the tool fetches the bytes itself and
-// returns a local path. Handler-level cases run the real handleToolCall against a mock bus (pointed at by --url before
+// returns a local path. Handler-level cases run the real handleToolCall against a mock bus (named in the home config before
 // import); the saver's own edge cases (rename retries, cleanup failures, a slow disk, a missing body) inject their fetch and
 // file functions.
 import { test, after, beforeEach, afterEach } from 'node:test';
@@ -11,11 +11,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Writable } from 'node:stream';
 import { execFileSync } from 'node:child_process';
-import { pinEnv, listenInRange, closeServer } from './helpers.mjs';
+import { pinEnv, answerBusProof, listenInRange, closeServer } from './helpers.mjs';
 
 const files = new Map(); // id -> { view, viewStatus?, viewHang?, raw?(req, res) }
 const hits = [];         // every request the fake bus saw: { path, headers }
 const server = http.createServer((req, res) => {
+  if (answerBusProof(req, res)) return;
   const p = new URL(req.url, 'http://x').pathname;
   hits.push({ path: p, headers: req.headers });
   const json = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
@@ -35,8 +36,8 @@ const server = http.createServer((req, res) => {
 const port = await listenInRange(server);
 after(() => closeServer(server));
 
-pinEnv({ DEV_SYNC_UPLOAD_TIMEOUT_MS: '1500', DEV_SYNC_KEY: 'test-key' });
-process.argv.push('--url', `ws://127.0.0.1:${port}/ws`, '--project', 'testproj', '--developer', 'getfiletest');
+pinEnv({ DEV_SYNC_UPLOAD_TIMEOUT_MS: '1500', DEV_SYNC_KEY: 'test-key' }, { port });
+process.argv.push('--project', 'testproj', '--developer', 'getfiletest');
 const { handleToolCall, makeFileSaver, makeApi, mapAgentFileResult, anySignal } = await import('../../client/index.js');
 
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');

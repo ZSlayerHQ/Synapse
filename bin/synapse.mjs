@@ -27,6 +27,7 @@ import { createRequire } from 'node:module';
 import { resolveHome, homePaths, parseEnvText, readJson, writeFileAtomic, DEFAULT_PORT, DEFAULT_HOST } from '../server/lib/home.mjs';
 import { loadHomeConfig, checkConfig, checkRegistry, checkDiscord, discordTokenProblem, withDefaults, PROJECT_RE, BOT_RE, DEFAULT_CHANNELS, DEFAULT_DISCORD_TOKEN_ENV } from '../server/lib/config.mjs';
 import { hashHumanKey, humanKeyProblem, NAME_RE, ROLES } from '../server/lib/people.mjs';
+import busProof from '../shared/bus-proof.cjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SOURCE_ROOT = path.resolve(__dirname, '..');
@@ -43,6 +44,8 @@ const HOOKS = [
   { event: 'PostToolUse', matcher: 'Edit|Write|MultiEdit|Bash', script: 'post-sync.cjs', timeout: 5 },
 ];
 const IS_WIN = process.platform === 'win32';
+// A table read by a name from a file or an argument: own properties only, so "constructor" or "__proto__" is never an entry.
+const ownEntry = (obj, k) => (obj && typeof obj === 'object' && typeof k === 'string' && Object.hasOwn(obj, k) ? obj[k] : undefined);
 // A step check that does nothing here. Only code running in this process can replace it (the test harness
 // scripts/cli-fault-harness.mjs sets globalThis.__synapseCliOps before importing this file); no environment variable can.
 const fault = (globalThis.__synapseCliOps && globalThis.__synapseCliOps.check) || (() => {});
@@ -78,10 +81,17 @@ const jsonText = (o) => JSON.stringify(o, null, 2) + '\n';
 const fileKey = (file) => fwd(path.resolve(file));
 const few = (l) => `${l.slice(0, 5).join(', ')}${l.length > 5 ? `, and ${l.length - 5} more` : ''}`;
 
-const ok = (m) => console.log(`  ok    ${m}`);
-const bad = (m) => console.log(`  FAIL  ${m}`);
-const note = (m) => console.log(`  note  ${m}`);
-const warn = (m) => console.log(`  warn  ${m}`);
+// A status line can carry values read from project files (doctor) or other files: control characters (C0, DEL, C1, so
+// every ANSI escape), line and bidi separators are printed as visible \uXXXX escapes, and a line is capped, so a
+// repository cannot write to the terminal or forge a status line.
+const printable = (m) => {
+  const s = String(m).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  return s.length > 2000 ? `${s.slice(0, 2000)}…` : s;
+};
+const ok = (m) => console.log(`  ok    ${printable(m)}`);
+const bad = (m) => console.log(`  FAIL  ${printable(m)}`);
+const note = (m) => console.log(`  note  ${printable(m)}`);
+const warn = (m) => console.log(`  warn  ${printable(m)}`);
 function die(msg, code = 1) { console.error(`synapse: ${msg}`); process.exit(code); }
 
 // ─── Key file protection ───
@@ -262,7 +272,7 @@ function envTextWith(name, value) {
 const newKey = () => randomBytes(32).toString('base64url');
 const keyEnvFor = (id) => `SYNAPSE_KEY_${id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
 // The key a bot's sessions use: its own when the roster binds one, else the project's.
-const sessionKeyEnv = (project, bot) => (project && project.roster && project.roster[bot] && project.roster[bot].keyEnv) || (project && project.keyEnv);
+const sessionKeyEnv = (project, bot) => (ownEntry(project && project.roster, bot) && ownEntry(project.roster, bot).keyEnv) || (project && project.keyEnv);
 
 // ─── Project wiring ───
 function readJsonStrict(file, fallback) {
@@ -507,7 +517,7 @@ async function cmdSetHumanKey() {
   if (!fs.existsSync(P.config) || !fs.existsSync(MARKER)) die('no Synapse home here; run "synapse init" first');
   const cfg = readJson(P.config);
   const role = args.flags.role;
-  if (!(cfg.people && cfg.people[name]) && (!role || !ROLES.includes(role))) die(`"${name}" is not in people; add them with --role ${ROLES.join('|')}`);
+  if (!ownEntry(cfg.people, name) && (!role || !ROLES.includes(role))) die(`"${name}" is not in people; add them with --role ${ROLES.join('|')}`);
   const key = await readSecretLine(`Personal key for ${name} (12-256 printable characters, no spaces; not shown): `);
   const confirm = args.flags.stdin || !process.stdin.isTTY ? key : await readSecretLine('Again: ');
   if (key !== confirm) die('the two entries differ; nothing changed');
@@ -517,7 +527,7 @@ async function cmdSetHumanKey() {
     const m = readManifest();
     const fresh = readJson(P.config);
     fresh.people = fresh.people || {};
-    if (!fresh.people[name]) fresh.people[name] = { roles: [role], ...(args.flags.projects ? { projects: String(args.flags.projects).split(',').map((s) => s.trim()).filter(Boolean) } : {}) };
+    if (!ownEntry(fresh.people, name)) fresh.people[name] = { roles: [role], ...(args.flags.projects ? { projects: String(args.flags.projects).split(',').map((s) => s.trim()).filter(Boolean) } : {}) };
     fresh.people[name].keyHash = hashHumanKey(key);
     applyWrites(withManifest(m, [{ file: P.config, text: jsonText(fresh) }]));
   });
@@ -542,6 +552,8 @@ async function cmdAddProject() {
     const otherFile = path.join(dir, '.claude', shared ? 'settings.local.json' : 'settings.json');
     const mcpFile = path.join(dir, '.mcp.json');
     const localCfgFile = path.join(dir, '.synapse', 'config.json');
+    const link = linkInProject(dir);
+    if (link) die(`${linkRefusal(dir, link)}, then run add-project again. Nothing was changed.`);
     try {
       cfg = readJson(P.config);
       reg = readJson(P.projects);
@@ -561,9 +573,9 @@ async function cmdAddProject() {
     if (!PROJECT_RE.test(id)) die(`"${id}" is not a valid project id; pass --id <id>`);
     const bot = String(args.flags.bot || (localCfg && localCfg.developer) || `${id.replace(/[^a-z0-9]/g, '')}bot`).toLowerCase();
     if (!BOT_RE.test(bot) || bot.includes('.')) die(`"${bot}" is not a valid bot name; pass --bot <name>`);
-    if (cfg.people && cfg.people[bot]) die(`"${bot}" is a person's name; a bot needs its own name (--bot)`);
+    if (ownEntry(cfg.people, bot)) die(`"${bot}" is a person's name; a bot needs its own name (--bot)`);
     if (bot === (cfg.systemSender || 'synapse')) die(`"${bot}" is the bus's own sender name; choose another --bot`);
-    const prev = reg.projects[id];
+    const prev = ownEntry(reg.projects, id) || null;
     if (prev && prev.root && !samePath(prev.root, dir)) die(`project id "${id}" is already used for ${prev.root}; pass --id <another id>`);
     const keyEnv = keyEnvFor(id);
     // Every key name in the registry, project or per-bot, has one owner.
@@ -584,7 +596,7 @@ async function cmdAddProject() {
       root: fwd(dir),
       keyEnv,
       assertableBots: [...new Set([...((prev && prev.assertableBots) || []), bot])],
-      roster: { ...prevRoster, [bot]: prevRoster[bot] || { displayName: bot } },
+      roster: { ...prevRoster, [bot]: ownEntry(prevRoster, bot) || { displayName: bot } },
     };
     const candidate = { ...reg, projects: { ...reg.projects, [id]: entry } };
     const botKeyEnv = sessionKeyEnv(entry, bot); // the bot's own key when the roster binds one
@@ -657,6 +669,24 @@ async function cmdAddProject() {
 }
 const addOnce = (list, v) => { if (!list.includes(v)) list.push(v); };
 
+// Every path inside a project that Synapse reads or writes. A repository can make any of them (or a folder on the way) a
+// symbolic link or junction pointing anywhere, so none is ever followed: the first link found is returned (relative to
+// the project folder), else null. The project folder itself may be a link; that is the user's own choice.
+const PROJECT_PATHS = ['.gitignore', '.mcp.json', '.claude/settings.json', '.claude/settings.local.json', '.synapse/config.json'];
+function linkInProject(dir, rels = PROJECT_PATHS) {
+  for (const rel of rels) {
+    let cur = dir;
+    for (const part of rel.split('/')) {
+      cur = path.join(cur, part);
+      let st;
+      try { st = fs.lstatSync(cur); } catch { break; }
+      if (st.isSymbolicLink()) return fwd(path.relative(dir, cur));
+    }
+  }
+  return null;
+}
+const linkRefusal = (dir, rel) => `${fwd(path.join(dir, rel))} is a symbolic link (or junction). Synapse never reads or writes through a link inside a project, because a repository can point one anywhere (for example at your Synapse keys). Replace it with a regular file or folder`;
+
 // ─── The bus process ───
 function alive(pid) { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
 function serverEntry() {
@@ -673,13 +703,23 @@ async function health(timeoutMs = 1500, base = busUrl()) {
   try { const r = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(timeoutMs) }); return { url: `${base}/api/health`, body: await r.json() }; }
   catch (e) { return { url: `${base}/api/health`, error: e.cause ? e.cause.code || e.message : e.message }; }
 }
-// The running bus, proven: its owner file names a pid and an instance, and the bus on that port reports both.
+// Proof of bus (shared/bus-proof.cjs): the process at `base` answers a fresh nonce with an HMAC under this home's bus
+// secret, binding its pid and instance. Nothing here sends a key; a key is sent only after this resolves ok.
+async function proveBusAt(base) {
+  const get = async (url) => {
+    const r = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(1500) });
+    let body = null; try { body = await r.json(); } catch {}
+    return { status: r.status, body };
+  };
+  return busProof.proveBus({ httpUrl: base, home: HOME, get });
+}
+// The running bus, proven: its owner file names a pid and an instance, and the process on that port proves both.
 async function verifiedBus() {
   let owner = null;
   try { owner = readJson(OWNER_FILE); } catch { owner = null; }
   if (!owner) return { state: 'none' };
-  const h = await health(1500, `http://127.0.0.1:${owner.port}`);
-  if (h.body && h.body.pid === owner.pid && h.body.instance === owner.instance) return { state: 'running', owner };
+  const p = await proveBusAt(`http://127.0.0.1:${owner.port}`);
+  if (p.ok && p.pid === owner.pid && p.instance === owner.instance) return { state: 'running', owner };
   if (!alive(owner.pid)) return { state: 'stale', owner };
   return { state: 'unverified', owner };
 }
@@ -749,6 +789,13 @@ async function cmdDoctor() {
   const busUp = !!(h.body && h.body.status === 'healthy');
   if (busUp) ok(`bus healthy at ${busUrl()} (pid ${h.body.pid}); dashboard ${busUrl()}/`);
   else (ready ? fail : note)(`bus not reachable at ${h.url} (${h.error || 'no answer'}); start it with "synapse start --background"`);
+  // No key goes to the port until the process on it proves it holds this home's bus secret.
+  const proof = busUp ? await proveBusAt(busUrl()) : null;
+  const proven = !!(proof && proof.ok);
+  if (busUp) {
+    if (proven) ok(`bus identity proven: pid ${proof.pid} holds this home's bus secret`);
+    else fail(`bus identity NOT proven at ${busUrl()}: ${proof.reason}; no key was sent to it. Another program may hold the port: stop it, then "synapse start --background"`);
+  }
   // The Discord pack: the boot checks above already covered its config; here, what only the machine can tell.
   if (config && config.discord.enabled === true) {
     const tokenEnv = config.discord.tokenEnv || DEFAULT_DISCORD_TOKEN_ENV;
@@ -768,7 +815,7 @@ async function cmdDoctor() {
       else (ready ? fail : warn)(`discord: the bus is not connected to Discord (check the token, the Message Content intent and the bot's invite; the reason is in ${path.join(P.data, 'bus.log')})`);
     }
   } else if (config) note('discord: off ("synapse discord setup" turns it on)');
-  if (busUp && registry) {
+  if (proven && registry) {
     for (const [id, p] of Object.entries(registry.projects)) {
       const r = await whoami(env[p.keyEnv], id);
       if (r.status === 200) ok(`project ${id}: key accepted by the bus`);
@@ -779,12 +826,12 @@ async function cmdDoctor() {
   const claudeVersion = claudeCliVersion();
   if (claudeVersion) ok(`claude ${claudeVersion}`); else note('the claude CLI is not on PATH (needed to run sessions, not for the bus)');
   const dirs = args.flags.project ? [path.resolve(String(args.flags.project))] : Object.values((registry && registry.projects) || {}).map((p) => p.root).filter(Boolean);
-  for (const dir of dirs) failures += await checkProjectDir(dir, registry, { env, busUp, ready, unverified, probes });
+  for (const dir of dirs) failures += await checkProjectDir(dir, registry, { env, busUp: proven, ready, unverified, probes });
   if (ready && probes.length) {
     console.log('MCP probes');
     for (const p of probes) {
       if (failures) { bad(`${p.dir}: MCP probe not run, because of the problems above (the doctor never starts a client while any check fails)`); failures++; continue; }
-      const r = await probeMcp(p.args);
+      const r = await probeMcp(p.args, p.dir);
       if (r.ok) ok(`${p.dir}: the client starts and lists ${r.tools} tools`); else { bad(`${p.dir}: MCP probe failed: ${r.error}`); failures++; }
     }
   }
@@ -808,13 +855,18 @@ async function whoami(key, project) {
 async function checkProjectDir(dir, registry, { env, busUp, ready, unverified, probes }) {
   let f = 0;
   const fail = (m) => { f++; bad(m); };
-  console.log(`project folder ${dir}`);
+  console.log(`project folder ${printable(dir)}`);
+  const link = linkInProject(dir);
+  if (link) { fail(`${linkRefusal(dir, link)}; nothing in it was read`); return f; }
   let local;
   try { local = readJsonStrict(path.join(dir, '.synapse', 'config.json'), null); } catch (e) { fail(e.message); return f; }
   if (!local) { fail('.synapse/config.json is missing; run "synapse add-project"'); return f; }
-  const reg = registry && registry.projects[local.project];
+  const reg = registry && ownEntry(registry.projects, local.project);
   if (!reg) { fail(`.synapse/config.json names project "${local.project}", which is not in projects.json`); return f; }
   ok(`.synapse/config.json: project ${local.project}, bot ${local.developer}`);
+  // The hooks' rule (hooks/lib/synapse-hook.cjs): a project file is used only when the registry binds this folder to it.
+  if (local && typeof local === 'object' && Object.hasOwn(local, 'url')) fail('.synapse/config.json names a bus URL; the hooks refuse a project config that does (they use only the home config), so remove it');
+  if (typeof reg.root !== 'string' || !samePath(reg.root, dir)) fail(`projects.json binds project ${local.project} to ${reg.root || 'no folder'}, not this one, so the hooks do nothing here; run add-project for this folder`);
   if (!(reg.assertableBots || []).includes(local.developer)) fail(`bot "${local.developer}" is not in project ${local.project}'s assertableBots`);
   const keyEnv = sessionKeyEnv(reg, local.developer);
   const ownKey = keyEnv !== reg.keyEnv;
@@ -881,13 +933,14 @@ async function checkProjectDir(dir, registry, { env, busUp, ready, unverified, p
 }
 // Start the client as this installation would write it, with this doctor's own environment (no DEV_SYNC_* or
 // NODE_OPTIONS from the caller), and ask it for its tools.
-function probeMcp(clientArgs) {
+// Run in the project folder, as Claude Code runs it: the client binds to the project registered there.
+function probeMcp(clientArgs, cwd) {
   const env = {};
   for (const [k, v] of Object.entries(process.env)) if (!/^DEV_SYNC_/.test(k) && k !== 'NODE_OPTIONS') env[k] = v;
   Object.assign(env, { SYNAPSE_HOME: HOME, DEV_SYNC_SEAT: 'doctor' });
   return new Promise((resolve) => {
     let done = false;
-    const child = spawn(process.execPath, clientArgs, { env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+    const child = spawn(process.execPath, clientArgs, { cwd, env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
     const finishProbe = (r) => { if (done) return; done = true; clearTimeout(timer); try { child.kill(); } catch {} resolve(r); };
     const timer = setTimeout(() => finishProbe({ ok: false, error: 'no answer within 10 s' }), 10_000);
     let buf = '';
@@ -946,6 +999,8 @@ async function cmdUninstall() {
       const dir = path.resolve(dirKey);
       const before = problems.length + byHand.length;
       if (!fs.existsSync(dir)) { console.log(`  skip  ${dir} (folder gone)`); if (yes) delete m.projects[dirKey]; continue; }
+      const link = linkInProject(dir);
+      if (link) { const msg = `${linkRefusal(dir, link)}; this project's files were left as they are.`; problems.push(msg); console.log(`  FAIL  ${msg}`); continue; }
       if (rec.mcp && rec.mcp.file) {
         const file = path.join(dir, rec.mcp.file);
         let mcp = null;
@@ -1127,12 +1182,12 @@ async function cmdDiscord() {
     if (process.env[tokenEnv] !== undefined && process.env[tokenEnv] !== (token || env.get(tokenEnv))) die(`${tokenEnv} is set in this shell's environment and would be used instead of the token in ${P.env} by a bus started from it; unset it, then run this again. Nothing was changed.`);
     const people = { ...(cfg.people || {}) };
     for (const p of persons) {
-      if (!people[p.name]) die(`"${p.name}" is not in people; add them first (synapse set-human-key ${p.name} --role approver), then run this again. Nothing was changed.`);
+      if (!ownEntry(people, p.name)) die(`"${p.name}" is not in people; add them first (synapse set-human-key ${p.name} --role approver), then run this again. Nothing was changed.`);
       people[p.name] = { ...people[p.name], accounts: { ...(people[p.name].accounts || {}), discord: p.id } };
     }
     const projects = JSON.parse(JSON.stringify(discord.projects || {}));
-    for (const c of channelSpecs) projects[c.project] = { ...(projects[c.project] || {}), channels: { ...((projects[c.project] && projects[c.project].channels) || {}), [c.channel]: c.id } };
-    for (const c of cardSpecs) projects[c.project] = { ...(projects[c.project] || {}), cards: c.channel };
+    for (const c of channelSpecs) projects[c.project] = { ...(ownEntry(projects, c.project) || {}), channels: { ...((ownEntry(projects, c.project) && projects[c.project].channels) || {}), [c.channel]: c.id } };
+    for (const c of cardSpecs) projects[c.project] = { ...(ownEntry(projects, c.project) || {}), cards: c.channel };
     const next = { ...cfg, people, discord: { ...discord, enabled: true, tokenEnv, projects } };
     // Every check the bus runs at boot, with the bus's environment order: the process first, then <home>/.env.
     const checkEnv = effectiveEnv(env, token ? { [tokenEnv]: token } : {});
@@ -1180,6 +1235,6 @@ const commands = {
   discord: cmdDiscord,
   help,
 };
-const run = commands[cmd];
+const run = ownEntry(commands, cmd);
 if (!run) { help(); process.exit(cmd ? 1 : 0); }
 await run();

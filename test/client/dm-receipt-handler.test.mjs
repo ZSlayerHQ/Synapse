@@ -1,15 +1,16 @@
 // DM receipts through the real tool handlers: dev_msg_send surfaces a 200 body `error` and the receipt texts, and
-// dev_msg_history uses the base-addressed DM rule, as a dotted seat. The client is pointed at a mock bus via --url before
+// dev_msg_history uses the base-addressed DM rule, as a dotted seat. The client is pointed at a mock bus by its home config before
 // import; the key travels in the X-Dev-Key header from DEV_SYNC_KEY.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { pinEnv, listenInRange, closeServer } from './helpers.mjs';
+import { pinEnv, answerBusProof, listenInRange, closeServer } from './helpers.mjs';
 
 const keys = [];
 const historyQueries = [];
 const json = (res, body) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
 const server = http.createServer((req, res) => {
+  if (answerBusProof(req, res)) return;
   const p = new URL(req.url, 'http://x').pathname;
   keys.push(req.headers['x-dev-key']);
   let raw = '';
@@ -37,8 +38,8 @@ const server = http.createServer((req, res) => {
 const port = await listenInRange(server);
 after(() => closeServer(server));
 
-pinEnv({ DEV_SYNC_SEAT: 'desk', DEV_SYNC_KEY: 'receipt-key' });
-process.argv.push('--url', `ws://127.0.0.1:${port}/ws`, '--developer', 'receipttest');
+pinEnv({ DEV_SYNC_SEAT: 'desk', DEV_SYNC_KEY: 'receipt-key' }, { port });
+process.argv.push('--developer', 'receipttest');
 const { handleToolCall, DEVELOPER } = await import('../../client/index.js');
 const call = (name, args = {}) => Promise.race([
   handleToolCall({ params: { name, arguments: args } }),

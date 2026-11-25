@@ -8,11 +8,16 @@
  * tasks, cooperative file locks, alerts and activity.
  *
  * Launch (in a project's .mcp.json, under the server key "synapse"):
- *   node <home>/app/client/index.js --developer <name> [--project <id>] [--url ws://host:port/ws] [--key-env DEV_SYNC_KEY]
+ *   node <home>/app/client/index.js --developer <name> [--project <id>] [--key-env <variable>]
  * and start Claude Code with: claude --dangerously-load-development-channels server:synapse
  *
- * The key is never passed on the command line: it is read from the environment variable named by --key-env
- * (default DEV_SYNC_KEY), which <home>/.env may fill.
+ * A project's .mcp.json is repository content, so its arguments and environment are untrusted. The client sends a key
+ * only to the bus in <home>/synapse.config.json, and only the key the home
+ * registry (<home>/projects.json) binds to the project registered at this folder (the working folder or one above it).
+ * A --url or --http (only a launch command sets them), a --project or --key-env that disagrees with the registry, or a
+ * folder no project is registered at, stops the client before it connects. DEV_SYNC_URL is ignored: the environment can
+ * come from the project's .mcp.json too, so it cannot be told apart from the user's own. The key is never passed on the command line: it is read from that variable, which <home>/.env
+ * may fill.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -29,19 +34,21 @@ import { pipeline } from 'stream/promises';
 import { fileURLToPath } from 'url';
 import { numericId, createSeenSet, replayOnReconnect } from './replay.js';
 import { pickEarlier, earlierMessagesBlock, THREAD_CONTEXT_WAIT_MS, THREAD_HISTORY_LIMIT } from './thread-context.mjs';
+import busProof from '../shared/bus-proof.cjs';
 
 const CLIENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LOG_PREFIX = '[synapse]';
 const logErr = (s) => process.stderr.write(`${LOG_PREFIX} ${s}\n`);
 
 // ─── Synapse home ───
-// SYNAPSE_HOME wins. Otherwise the installed layout is <home>/app/client/index.js, so the folder two levels above this
-// client folder is the home when it holds synapse.config.json. Otherwise ~/.synapse.
+// The installed layout wins: a client at <home>/app/client/index.js uses that home when it holds synapse.config.json,
+// whatever SYNAPSE_HOME says, because a project's .mcp.json can set SYNAPSE_HOME. Otherwise (a source checkout)
+// SYNAPSE_HOME, else ~/.synapse.
 export function resolveHome({ env = process.env, clientDir = CLIENT_DIR, homedir = os.homedir(), exists = fs.existsSync } = {}) {
+  const installed = path.resolve(clientDir, '..', '..');
+  if (path.basename(path.resolve(clientDir, '..')) === 'app' && exists(path.join(installed, 'synapse.config.json'))) return installed;
   const fromEnv = String(env.SYNAPSE_HOME || '').trim();
   if (fromEnv) return path.resolve(fromEnv);
-  const installed = path.resolve(clientDir, '..', '..');
-  if (exists(path.join(installed, 'synapse.config.json'))) return installed;
   return path.join(homedir, '.synapse');
 }
 export const SYNAPSE_HOME = resolveHome();
@@ -76,10 +83,10 @@ function getArg(name) {
   const idx = args.indexOf(`--${name}`);
   return idx !== -1 && args[idx + 1] ? args[idx + 1] : null;
 }
-if (args.includes('--key')) logErr('--key is not supported and was ignored: put the key in the environment variable named by --key-env (default DEV_SYNC_KEY) or in the Synapse home .env file.');
+if (args.includes('--key')) logErr('--key is not supported and was ignored: the key is read from the variable the Synapse home registry binds to this project (filled from the Synapse home .env file when unset).');
 
 // ─── Bus URL ───
-// --url, else DEV_SYNC_URL, else server.host / server.port from <home>/synapse.config.json (127.0.0.1:4560 by default).
+// Only server.host / server.port from <home>/synapse.config.json (127.0.0.1:4560 by default).
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 4560;
 export function wsUrlFromConfig(config) {
@@ -102,8 +109,51 @@ function readConfig(home) {
 export function httpFromWs(wsUrl) {
   return String(wsUrl).replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://').replace(/\/ws\/?$/, '').replace(/\/$/, '');
 }
-export const WS_URL = getArg('url') || process.env.DEV_SYNC_URL || wsUrlFromConfig(readConfig(SYNAPSE_HOME));
-export const HTTP_URL = getArg('http') || httpFromWs(WS_URL);
+
+// ─── Binding to the home registry ───
+// One folder, by the CLI's rule; case-insensitive where the OS is.
+const foldPath = (p) => {
+  const s = path.resolve(String(p)).replace(/\\/g, '/').replace(/\/+$/, '');
+  return process.platform === 'win32' || process.platform === 'darwin' ? s.toLowerCase() : s;
+};
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const ownEntry = (obj, k) => (isObj(obj) && typeof k === 'string' && Object.hasOwn(obj, k) ? obj[k] : undefined);
+// The registered project whose root is this folder or the nearest folder above it, or null.
+function projectAt(registry, cwd) {
+  const here = foldPath(cwd);
+  let best = null;
+  for (const [id, p] of Object.entries(isObj(registry && registry.projects) ? registry.projects : {})) {
+    if (!isObj(p) || typeof p.root !== 'string' || !p.root) continue;
+    const root = foldPath(p.root);
+    if ((here === root || here.startsWith(`${root}/`)) && (!best || root.length > best.root.length)) best = { id, root, entry: p };
+  }
+  return best;
+}
+// Pure: decides the project, the key variable and the bus URL from the home files only. What a project file supplies
+// (--project, --key-env, --url, --http, DEV_SYNC_*) is checked against them, never trusted. Returns
+// { project, keyEnv, wsUrl, httpUrl, notes, refused }: refused is a reason string when the client must not connect.
+export function bindToHome({ home, cwd = process.cwd(), argv = {}, env = process.env, baseDeveloper = 'unknown', readJson = (f) => JSON.parse(fs.readFileSync(f, 'utf8')) } = {}) {
+  const notes = [];
+  let config = null;
+  try { config = readJson(path.join(home, 'synapse.config.json')); } catch { config = null; }
+  const wsUrl = wsUrlFromConfig(config);
+  if (env.DEV_SYNC_URL) notes.push(`DEV_SYNC_URL was ignored: the client sends its key only to the bus in ${path.join(home, 'synapse.config.json')}.`);
+  const out = { project: argv.project || env.DEV_SYNC_PROJECT || null, keyEnv: null, wsUrl, httpUrl: httpFromWs(wsUrl), notes, refused: null };
+  for (const [label, v] of [['--url', argv.url], ['--http', argv.http]]) {
+    if (v) return { ...out, refused: `${label} names a bus address, but the client sends its key only to the bus in ${path.join(home, 'synapse.config.json')}; remove ${label} from the launch command` };
+  }
+  let registry = null;
+  try { registry = readJson(path.join(home, 'projects.json')); } catch { registry = null; }
+  const here = projectAt(registry, cwd);
+  if (!here) return { ...out, refused: `no project in ${path.join(home, 'projects.json')} is registered at ${cwd} or a folder above it (run "synapse add-project" there)` };
+  if (out.project && out.project !== here.id) return { ...out, refused: `this folder is registered as project "${here.id}", not "${String(out.project).slice(0, 64)}"` };
+  const base = String(baseDeveloper).split('.')[0];
+  const own = ownEntry(here.entry.roster, base);
+  const keyEnv = (isObj(own) && typeof own.keyEnv === 'string' && own.keyEnv) || here.entry.keyEnv;
+  if (typeof keyEnv !== 'string' || !/^[A-Z_][A-Z0-9_]*$/.test(keyEnv)) return { ...out, project: here.id, refused: `the registry has no key for project "${here.id}"` };
+  if (argv.keyEnv && argv.keyEnv !== keyEnv) return { ...out, project: here.id, refused: `--key-env ${String(argv.keyEnv).slice(0, 64)} is not the key the registry binds for ${base} in project "${here.id}" (${keyEnv})` };
+  return { ...out, project: here.id, keyEnv };
+}
 
 // The version this process loaded, frozen at module load and sent in the handshake so a server log line shows which client
 // code a connection runs. Read from the app's package.json beside the client folder.
@@ -120,12 +170,46 @@ const BASE_DEVELOPER = process.env.DEV_SYNC_DEVELOPER || getArg('developer') || 
 const SEAT_RAW = (process.env.DEV_SYNC_SEAT || '').trim().toLowerCase();
 const SEAT = (SEAT_RAW === 'auto' ? String(process.pid) : SEAT_RAW).replace(/[^a-z0-9_-]/g, '').slice(0, 24);
 export const DEVELOPER = SEAT && !BASE_DEVELOPER.includes('.') ? `${BASE_DEVELOPER}.${SEAT}` : BASE_DEVELOPER;
-// The key comes only from the environment variable named by --key-env. Empty means no header; the server refuses the connection.
-export const KEY_ENV = getArg('key-env') || 'DEV_SYNC_KEY';
-const API_KEY = process.env[KEY_ENV] || '';
+export const BINDING = bindToHome({ home: SYNAPSE_HOME, argv: { project: getArg('project'), keyEnv: getArg('key-env'), url: getArg('url'), http: getArg('http') }, baseDeveloper: BASE_DEVELOPER });
+for (const n of BINDING.notes) logErr(n);
+export const WS_URL = BINDING.wsUrl;
+export const HTTP_URL = BINDING.httpUrl;
+// The key comes only from the variable the registry binds; a refused binding has no key at all, and the client stops in main().
+export const KEY_ENV = BINDING.keyEnv;
+const API_KEY = (!BINDING.refused && KEY_ENV && process.env[KEY_ENV]) || '';
+
+// ─── Proof of bus (shared/bus-proof.cjs) ───
+// The key leaves this process only after the process on the bus port has answered a fresh nonce with an HMAC under this
+// install's bus secret. The proof is kept for the life of one WebSocket connection to that bus and dropped when it closes
+// (a restart, or another process on the port), so the next request proves the bus again.
+let provenBus = null;
+let proving = null;
+let lastProofProblem = null;
+const proofGet = async (url) => {
+  const r = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(5000) });
+  let body = null;
+  try { body = await r.json(); } catch { body = null; }
+  return { status: r.status, body };
+};
+export const BUS_UNPROVEN = 'No key was sent: the process on the bus port did not prove it is this Synapse bus (it holds no proof under this home\'s bus secret). Check "synapse doctor".';
+export function ensureBus() {
+  if (provenBus) return Promise.resolve(true);
+  if (!proving) {
+    proving = busProof.proveBus({ httpUrl: HTTP_URL, home: SYNAPSE_HOME, get: proofGet }).then((r) => {
+      proving = null;
+      if (r.ok) { provenBus = r; lastProofProblem = null; return true; }
+      if (r.reason !== lastProofProblem) logErr(`no key sent: ${r.reason}`);
+      lastProofProblem = r.reason;
+      return false;
+    }, () => { proving = null; return false; });
+  }
+  return proving;
+}
+// The key, only once the bus is proven; otherwise empty (the bus then refuses the request, and nothing is disclosed).
+const busKey = () => (provenBus ? API_KEY : '');
 const CHANNELS = getArg('channels') || 'all';
-// Project scope: unset => null => the server's default project.
-export const PROJECT = getArg('project') || process.env.DEV_SYNC_PROJECT || null;
+// Project scope: the project registered at this folder.
+export const PROJECT = BINDING.project;
 
 // ─── MCP server with the channel capability ───
 
@@ -210,6 +294,10 @@ function stopHeartbeat() {
 }
 
 function connectWs() {
+  if (!provenBus) {
+    ensureBus().then((ok) => (ok ? connectWs() : scheduleReconnect()));
+    return;
+  }
   // Effort level and model, when Claude Code exposes them, ride the handshake as plain telemetry.
   const effort = process.env.CLAUDE_EFFORT || process.env.EFFORT_LEVEL || getArg('effort') || 'unknown';
   const model = process.env.CLAUDE_MODEL || process.env.MODEL || getArg('model') || 'unknown';
@@ -220,7 +308,7 @@ function connectWs() {
   try {
     // The header is attached only when a key resolved. With no key it is absent and the server refuses the connection
     // on the missing credential (close code 4001), rather than on a confusing empty header.
-    ws = new WebSocket(url, API_KEY ? { headers: { 'X-Dev-Key': API_KEY } } : {});
+    ws = new WebSocket(url, busKey() ? { headers: { 'X-Dev-Key': busKey() } } : {});
   } catch (err) {
     scheduleReconnect();
     return;
@@ -241,7 +329,7 @@ function connectWs() {
       replayOnReconnect({
         httpUrl: HTTP_URL,
         project: PROJECT,
-        key: API_KEY,
+        key: busKey(),
         developer: DEVELOPER, // DM scoping: replay returns only DMs to/from this seat
         sinceId: lastSeenId,
         deliver: (m) => handleWsEvent({ event: 'message', ...m }),
@@ -272,6 +360,7 @@ function connectWs() {
   });
 
   ws.on('close', () => {
+    provenBus = null; // never across a bus restart: the next connect or request proves the bus again
     stopHeartbeat();
     logErr('Disconnected, reconnecting...');
     scheduleReconnect();
@@ -620,12 +709,14 @@ export function isMyDm(m, developer) {
 }
 
 // No project header when PROJECT is null: the server's default project. Shared by api() and dev_get_file's raw download.
-const busHeaders = () => ({ 'X-Dev-Key': API_KEY, ...(PROJECT ? { 'X-Dev-Project': PROJECT } : {}) });
-const api = makeApi({
+const busHeaders = () => ({ 'X-Dev-Key': busKey(), ...(PROJECT ? { 'X-Dev-Project': PROJECT } : {}) });
+const rawApi = makeApi({
   httpUrl: HTTP_URL,
   headers: busHeaders,
   defaultTimeoutMs: API_TIMEOUT_MS,
 });
+// Every bus call proves the bus first; an unproven bus gets no request at all.
+const api = async (...a) => ((await ensureBus()) ? rawApi(...a) : { error: BUS_UNPROVEN });
 
 // The dev_send_file request: the body read sits inside the same outcome handling as the request, so a timeout at either
 // stage is "outcome unknown" (the file may already be stored), never "File not sent".
@@ -1208,6 +1299,7 @@ export async function handleToolCall(request, extra) {
     }
 
     case 'dev_send_file': {
+      if (!(await ensureBus())) return errText(BUS_UNPROVEN);
       try {
         const fileBuf = fs.readFileSync(params.filePath);
         if (fileBuf.length > 100 * 1024 * 1024) {
@@ -1494,6 +1586,16 @@ const MAX_FILE_BYTES = 100 * 1024 * 1024; // the bus's upload cap
 const SAVE_TIMEOUT_MS = Math.min(UPLOAD_TIMEOUT_MS, 300_000);
 const PRUNE_AFTER_MS = 24 * 60 * 60 * 1000;
 const FILES_FOLDER = 'synapse-files'; // the tool's own folder under the base: pruning never looks anywhere else
+// The folder is private to this OS user: never a shared temp folder by default (the base is <home>/data), created 0700,
+// and a pre-existing one owned by someone else or writable by group or others is refused. Files are created 0600.
+// POSIX only: Windows has no mode bits, and a user's home and its ACLs are already private.
+async function privateFolderProblem(dir, st) {
+  if (process.platform === 'win32') return null;
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return 'not owned by this user';
+  if (st.mode & 0o022) return 'writable by group or others';
+  if (st.mode & 0o077) await fs.promises.chmod(dir, 0o700); // an own folder from an older version: close it
+  return null;
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const OWN_NAME_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9a-f]{16}(\.[a-z0-9]{1,8})?(\.part)?$/;
@@ -1535,7 +1637,7 @@ export function makeFileSaver({
   rename = (a, b) => fs.promises.rename(a, b),
   unlink = (p) => fs.promises.unlink(p),
   // Opens the part exclusively and resolves only once this call holds it: that resolution is the ownership record.
-  openPart = async (p) => (await fs.promises.open(p, 'wx')).createWriteStream(),
+  openPart = async (p) => (await fs.promises.open(p, 'wx', 0o600)).createWriteStream(),
   sleep = (ms, signal) => new Promise((r) => {
     const t = setTimeout(r, ms);
     signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, { once: true });
@@ -1581,12 +1683,14 @@ export function makeFileSaver({
 
     const base = process.env.SYNAPSE_FILES_DIR;
     if (base && !path.isAbsolute(base)) return fail(SAVE_REASONS.notAbsolute);
-    const dir = path.join(base || os.tmpdir(), FILES_FOLDER);
+    const dir = path.join(base || path.join(SYNAPSE_HOME, 'data'), FILES_FOLDER);
     if (stop.aborted) return halted();
     try {
-      await fs.promises.mkdir(dir, { recursive: true });
+      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
       const st = await fs.promises.lstat(dir); // lstat reports a junction or link as itself, never as a directory
       if (!st.isDirectory()) return fail(SAVE_REASONS.folder('not a plain folder'));
+      const problem = await privateFolderProblem(dir, st);
+      if (problem) return fail(SAVE_REASONS.folder(problem));
     } catch (e) { return fail(SAVE_REASONS.folder(errCode(e))); }
     if (stop.aborted) return halted();
     await pruneOldCopies(dir, stop);
@@ -1778,7 +1882,7 @@ export function mapNotifyResult(result, { tag } = {}) {
 // "Stored" when the bus says so (ok:true, or stored:true on a 500), then one line for the Discord post from `relay`; "not
 // stored" only for the errors the route returns before storing; everything else (another 500, a lost response, a non-JSON
 // body) is "outcome unknown".
-const SEND_FILE_PRESTORE = [[400, 'No file attached'], [413, 'File too large (max 100MB)'], [400, 'bad_upload'], [400, 'File type not allowed']];
+const SEND_FILE_PRESTORE = [[400, 'No file attached'], [413, 'File too large (max 100MB)'], [400, 'bad_upload'], [400, 'File type not allowed'], [400, 'sender_required'], [413, 'over_project_budget']];
 
 function relayLine(data) {
   switch (data && data.relay) {
@@ -1968,6 +2072,10 @@ export function removeSeatFile(file, pid = process.pid) {
 // ─── Start ───
 
 async function main() {
+  if (BINDING.refused) {
+    logErr(`not starting: ${BINDING.refused}. A project's .mcp.json is repository content, so the client trusts only the Synapse home config and registry; no key was sent.`);
+    process.exit(1);
+  }
   const seatFile = writeSeatFile({ home: SYNAPSE_HOME, sessionId: process.env.CLAUDE_CODE_SESSION_ID, developer: DEVELOPER, project: PROJECT });
   process.on('exit', () => removeSeatFile(seatFile));
   // A clean exit: the host closed stdin (the MCP stdio shutdown) or sent a signal. process.exit runs the exit handler above.

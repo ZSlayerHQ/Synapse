@@ -7,8 +7,13 @@
 //   per-bot key   -> may assert ONLY that bot (or a seat of it)
 //   human         -> a configured person, authenticated by their personal key; may assert ONLY their own name, and only
 //                    in projects they are allowed in
-// Pseudo-emitters (the system sender, 'dashboard', 'unknown') are never assertable by a client: the server's own
-// in-process sends set them directly and never pass through this gate.
+// Pseudo-emitters (the system sender and RESERVED_NAMES) are never assertable by a client, even when a registry lists
+// one as a bot: the server's own in-process sends set them directly and never pass through this gate.
+//
+// Every lookup keyed by a request value (a project id, a bot or roster name) reads own properties only, so an inherited
+// name such as "constructor" or "__proto__" never resolves to a project or a roster entry.
+
+import { PROJECT_RE, RESERVED_NAMES } from './config.mjs';
 
 export const ACTOR_FIELDS = ['developer', 'sender', 'from', 'createdBy', 'initiator', 'updatedBy', 'reviewer'];
 
@@ -29,23 +34,35 @@ export function seatBase(name) {
 export function isAbsentActor(v) { return v === undefined || v === null; }
 export function isPresentInvalidActor(v) { return typeof v !== 'string' || v.length === 0; }
 
-export function createAuth({ registry, env = process.env, people }) {
-  const projects = () => registry.projects || {};
+const own = (obj, k) => (obj && typeof obj === 'object' && typeof k === 'string' && Object.hasOwn(obj, k) ? obj[k] : undefined);
+
+// The registry entry for a project id: a valid id that the registry holds as its own property, else null.
+export function projectEntry(registry, id) {
+  if (typeof id !== 'string' || !PROJECT_RE.test(id)) return null;
+  const p = own(registry && registry.projects, id);
+  return p && typeof p === 'object' ? p : null;
+}
+export const rosterEntry = (project, name) => own(project && project.roster, name) || null;
+
+export function createAuth({ registry, env = process.env, people, systemSender = 'synapse' }) {
+  const reserved = new Set([...RESERVED_NAMES, systemSender]);
+  const keyOf = (envName) => {
+    const v = typeof envName === 'string' && envName ? env[envName] : undefined;
+    return typeof v === 'string' && v ? v : null;
+  };
 
   function projectKey(projectId) {
-    const p = projects()[projectId];
-    const v = p && p.keyEnv ? env[p.keyEnv] : undefined;
-    return v || null; // no global fallback in v2: a project without its own key cannot authenticate
+    const p = projectEntry(registry, projectId);
+    return p ? keyOf(p.keyEnv) : null; // no global fallback in v2: a project without its own key cannot authenticate
   }
 
   function matchBotKey(projectId, key) {
-    if (!key) return null;
-    const p = projects()[projectId];
+    if (typeof key !== 'string' || !key) return null;
+    const p = projectEntry(registry, projectId);
     if (!p) return null;
-    const roster = p.roster || {};
     for (const name of p.assertableBots || []) {
-      const ke = roster[name] && roster[name].keyEnv;
-      const val = ke && env[ke];
+      const ke = rosterEntry(p, name) && rosterEntry(p, name).keyEnv;
+      const val = keyOf(ke);
       if (val && key === val) return name;
     }
     return null;
@@ -54,8 +71,9 @@ export function createAuth({ registry, env = process.env, people }) {
   function bindIdentity(authProject, name, req) {
     if (isAbsentActor(name)) return true;
     if (isPresentInvalidActor(name)) return false;
-    const proj = projects()[authProject];
+    const proj = projectEntry(registry, authProject);
     if (!proj) return false;
+    if (reserved.has(name) || reserved.has(seatBase(name))) return false;
     const bots = proj.assertableBots || [];
     const presentedKey = req && req.headers && req.headers['x-dev-key'];
     if (req && req.humanPrincipal) {
@@ -64,8 +82,8 @@ export function createAuth({ registry, env = process.env, people }) {
     if (req && req.botPrincipal) return seatBase(name) === req.botPrincipal;
     const botBase = seatBase(name);
     if (botBase && bots.includes(botBase)) {
-      const ke = proj.roster && proj.roster[botBase] && proj.roster[botBase].keyEnv;
-      const botKeyVal = ke && env[ke];
+      const ke = rosterEntry(proj, botBase) && rosterEntry(proj, botBase).keyEnv;
+      const botKeyVal = keyOf(ke);
       if (botKeyVal) return presentedKey === botKeyVal;
       return true;
     }
@@ -95,9 +113,10 @@ export function createAuth({ registry, env = process.env, people }) {
   function bindSecondaryActor(authProject, claimedName, resourceOwner, presentedKey) {
     if (isAbsentActor(claimedName)) return true;
     if (isPresentInvalidActor(claimedName)) return false;
-    const proj = projects()[authProject];
-    const ke = proj && proj.roster && proj.roster[claimedName] && proj.roster[claimedName].keyEnv;
-    const botKeyVal = ke && env[ke];
+    if (reserved.has(claimedName)) return false;
+    const proj = projectEntry(registry, authProject);
+    const ke = rosterEntry(proj, claimedName) && rosterEntry(proj, claimedName).keyEnv;
+    const botKeyVal = keyOf(ke);
     if (botKeyVal) return presentedKey === botKeyVal;
     if (!resourceOwner) return !!(proj && (proj.assertableBots || []).includes(claimedName));
     return claimedName === resourceOwner;

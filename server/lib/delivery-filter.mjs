@@ -13,6 +13,8 @@
 // the digest set only within digestChannels; it can never silence a human sender or an
 // @mention. Absent/empty config = 'live' for everything = today's behavior (dark ship).
 
+import { sanitizeText } from './sanitize.mjs';
+
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // msg: { channel, sender, content }   seat: connection's developer name (may be dotted)
@@ -38,14 +40,25 @@ export function classifyDelivery(msg, seat, cfg, { seatBase, humans }) {
 // each: [HH:MM] sender→#channel: first ~160 code points, newlines flattened, LOUD ellipsis on
 // truncation. Full text stays on the bus (dev_msg_history) — the digest is a pointer, not a copy.
 const LINE_CAP = 160;
+const LINE_SEPARATORS = [String.fromCharCode(0x2028), String.fromCharCode(0x2029), String.fromCharCode(0x85)];
+
+// Each entry is made safe on its own before the lines are joined: its text goes through the bus sanitiser, every line
+// break becomes a space, and any '<' or '>' left becomes a guillemet. So the sanitiser's later pass over the joined digest
+// (sendDirect) can never match a tag that spans two entries: one peer's text cannot delete another peer's line, move its
+// own text under another sender, or make the whole digest look like relayed content to the client.
+function entryText(v, max) {
+  let s = sanitizeText(String(v ?? ''), max);
+  for (const sep of LINE_SEPARATORS) s = s.split(sep).join(' ');
+  return s.replace(/\s*[\r\n]+\s*/g, ' ').replace(/</g, '‹').replace(/>/g, '›');
+}
 
 export function formatDigest(entries) {
   const lines = entries.map((e) => {
     const hhmm = String(e.timestamp || '').slice(11, 16) || '--:--';
-    const flat = String(e.content || '').replace(/\s*\n\s*/g, ' ');
+    const flat = entryText(e.content, 4 * LINE_CAP);
     const cps = Array.from(flat);
     const body = cps.length <= LINE_CAP ? flat : cps.slice(0, LINE_CAP - 1).join('') + '…';
-    return `[${hhmm}] ${e.sender}→#${e.channel}: ${body}`;
+    return `[${hhmm}] ${entryText(e.sender, 80)}→#${entryText(e.channel, 32)}: ${body}`;
   });
   return `📰 Digest — ${entries.length} message(s) while filtered (full text via dev_msg_history):\n${lines.join('\n')}`;
 }

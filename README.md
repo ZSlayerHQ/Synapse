@@ -31,6 +31,24 @@ tools are not checked. If approvals must hold against unrestricted agents, run t
 the agents cannot read or write, and hand the agents only project keys. That setup is an option, not the default.
 Details: [AGENTS.md](AGENTS.md#trust-model-what-synapse-is-and-is-not).
 
+**A repository's files are untrusted.** A branch, a clone or a vendored folder can carry its own `.synapse/config.json`,
+so that file only names a project and a bot. The hooks use it only when `<home>/projects.json` registers that project at
+exactly that folder, send only the key the registry binds for that bot, and send it only to the bus in
+`<home>/synapse.config.json` (never a URL from the project, never `DEV_SYNC_URL`). Otherwise they send nothing and say why.
+The same holds for a project's `.mcp.json`: the MCP client sends only the key the registry binds to the project
+registered at its working folder, only to that bus, and stops before connecting on a `--url`, `--http`, or a
+`--project` or `--key-env` the registry disagrees with. An installed client also ignores `SYNAPSE_HOME`.
+
+**Keys go only to a proven bus.** Another account on the machine could take the bus port while the bus is down. So the
+client, the hooks and `synapse doctor` first send a random nonce with no key, and send a key only when the answer is an
+HMAC of it under `<home>/data/bus-secret` (a private file the bus writes once and never sends). Otherwise they refuse
+and say why. The dashboard cannot check this from a browser: open it only while `synapse doctor` shows the bus proven.
+
+**Only approve a `synapse` MCP server you added yourself.** Claude Code runs whatever command a project's `.mcp.json`
+names. A cloned repository's `.mcp.json` can therefore run its own code before Synapse checks anything, so approve the
+`synapse` server only in a project where you ran `synapse add-project` yourself. `synapse doctor` reports a `.mcp.json`
+entry that differs from what add-project wrote.
+
 **Discord (optional, off by default)** adds a second way in. Only Discord accounts mapped to a configured person count;
 each acts as that person, only in projects that person is allowed in, and only an owner or approver of a card's
 project can decide it, by a tap on that card's own message (the bus checks this, not the pack). Every other account is refused and logged. Whoever holds the

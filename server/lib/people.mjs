@@ -49,7 +49,9 @@ export function createPeople(config) {
   const owners = new Set(Array.isArray(config && config.owners) ? config.owners : []);
   const verified = new Map(); // name -> sha256(key) of the last key that verified, so scrypt runs once per key
 
-  const exists = (name) => typeof name === 'string' && Object.prototype.hasOwnProperty.call(people, name);
+  const exists = (name) => typeof name === 'string' && Object.hasOwn(people, name);
+  // A person's account ids of one kind, by own property only: an inherited kind ("constructor") is never an account.
+  const accountsOf = (p, kind) => (p && p.accounts && typeof p.accounts === 'object' && typeof kind === 'string' && Object.hasOwn(p.accounts, kind) ? p.accounts[kind] : undefined);
   const rolesOf = (name) => {
     if (!exists(name)) return new Set();
     const r = new Set(Array.isArray(people[name].roles) ? people[name].roles : []);
@@ -90,7 +92,7 @@ export function createPeople(config) {
       const r = rolesOf(n);
       if (!((r.has('owner') || r.has('approver')) && allowedIn(n, project))) return false;
       if (typeof people[n].keyHash === 'string' && people[n].keyHash) return true;
-      return providers.some((pv) => people[n].accounts && people[n].accounts[pv] !== undefined);
+      return providers.some((pv) => accountsOf(people[n], pv) !== undefined);
     }),
     // The @-tags a bot may use in this project: owners and pingable people allowed in it.
     pingableFor: (project) => Object.keys(people).filter((n) => {
@@ -104,11 +106,13 @@ export function createPeople(config) {
       if (id === undefined || id === null || id === '' || typeof kind !== 'string') return null;
       const hits = [];
       for (const [name, p] of Object.entries(people)) {
-        const ids = p && p.accounts && p.accounts[kind];
+        const ids = accountsOf(p, kind);
         if (ids !== undefined && [].concat(ids).map(String).includes(String(id))) hits.push(name);
       }
       return hits.length === 1 ? hits[0] : null;
     },
+    // True only when this exact key already verified for this person on this bus (a hash compare in memory, no scrypt).
+    knownGood: (name, key) => exists(name) && typeof key === 'string' && !!key && verified.get(name) === sha(key),
     verifyKey: (name, key) => {
       if (!exists(name) || humanKeyProblem(key)) return false;
       const h = sha(key);

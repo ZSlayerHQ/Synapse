@@ -231,7 +231,9 @@ function rpcPeer(child) {
 }
 
 test('the real client: a card answered while it is disconnected arrives after the reconnect, is acked, and leaves the outbox empty', { timeout: 60000 }, async () => {
-  const fx = makeHome({ projects: { alpha: { bots: ['alphabot'] } } });
+  // The client binds to the project registered at its working folder and to the bus in the home config.
+  const projDir = tempHome('synapse-reconnect-proj-');
+  const fx = makeHome({ projects: { alpha: { bots: ['alphabot'], root: projDir.replace(/\\/g, '/') } } });
   let bus = null;
   let port = 0;
   for (let i = 0; i < 8 && !bus; i++) {
@@ -239,7 +241,10 @@ test('the real client: a card answered while it is disconnected arrives after th
     try { bus = await busOn(fx.home, port); } catch (e) { if (i === 7) throw e; }
   }
   const SEAT = 'alphabot.rc';
-  const child = spawn(process.execPath, [CLIENT_INDEX, '--project', 'alpha', '--developer', 'alphabot', '--key-env', 'SYNAPSE_KEY_ALPHA', '--url', `ws://127.0.0.1:${port}/ws`], {
+  const cfgFile = path.join(fx.home, 'synapse.config.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(cfgFile, 'utf8')), server: { host: '127.0.0.1', port } }));
+  const child = spawn(process.execPath, [CLIENT_INDEX, '--project', 'alpha', '--developer', 'alphabot', '--key-env', 'SYNAPSE_KEY_ALPHA'], {
+    cwd: projDir,
     env: childEnv({ SYNAPSE_HOME: fx.home, DEV_SYNC_SEAT: 'rc', SYNAPSE_KEY_ALPHA: fx.keys.alpha, DEV_SYNC_RECONNECT_MS: String(RECONNECT_MS), CLAUDE_CODE_SESSION_ID: SESSION_ID }),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -308,5 +313,6 @@ test('the real client: a card answered while it is disconnected arrives after th
     if (child.exitCode === null && child.signalCode === null) child.kill();
     if (bus) await bus.stop();
     fs.rmSync(fx.home, { recursive: true, force: true });
+    fs.rmSync(projDir, { recursive: true, force: true });
   }
 });
