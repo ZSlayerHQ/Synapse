@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synapse</title>
+<link rel="stylesheet" href="/dashboard/style.css">
+<script type="module" src="/dashboard/app.js"></script>
+</head>
+<body>
+<header>
+  <h1>Synapse</h1>
+  <span id="who"></span>
+  <button id="signout" hidden>Sign out</button>
+</header>
+<main>
+  <section id="signin">
+    <h2>Sign in</h2>
+    <p>Use your name from <code>synapse.config.json</code> and the personal key you set with <code>synapse set-human-key</code>.
+       The key is kept in this browser tab only.</p>
+    <form id="signin-form">
+      <label>Name <input id="name" autocomplete="username" required></label>
+      <label>Personal key <input id="key" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+      <p id="signin-error" class="error" role="alert"></p>
+    </form>
+  </section>
+  <div id="app" hidden>
+    <section>
+      <h2>Decision cards <span id="cards-count" class="count"></span></h2>
+      <div id="cards"><p class="muted">No open cards.</p></div>
+    </section>
+    <section>
+      <h2>Notifications</h2>
+      <ul id="notifications" class="feed"></ul>
+    </section>
+    <section>
+      <h2>Online</h2>
+      <ul id="online" class="feed"></ul>
+    </section>
+    <section>
+      <h2>Messages</h2>
+      <form id="post-form">
+        <select id="post-project" aria-label="Project"></select>
+        <select id="post-channel" aria-label="Channel"></select>
+        <input id="post-text" placeholder="Post as yourself" required>
+        <button type="submit">Send</button>
+      </form>
+      <ul id="messages" class="feed"></ul>
+    </section>
+  </div>
+</main>
+</body>
+</html>

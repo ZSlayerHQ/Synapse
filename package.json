@@ -1,0 +1,30 @@
+{
+  "name": "synapse-bus",
+  "version": "2.0.0-alpha.1",
+  "description": "A local coordination bus for Claude Code sessions: messages, file locks, tasks, decision cards and a channel push into each session.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.15"
+  },
+  "bin": {
+    "synapse": "bin/synapse.mjs"
+  },
+  "scripts": {
+    "start": "node server/server.mjs",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\"",
+    "leak-check": "node scripts/leak-check.mjs",
+    "release-check": "node scripts/leak-check.mjs --history --require-denylist --require-secrets"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^4.21.0",
+    "express-rate-limit": "^8.3.2",
+    "multer": "^2.1.1",
+    "ws": "^8.20.0"
+  },
+  "optionalDependencies": {
+    "discord.js": "^14.28.1"
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+projects.json
+.synapse/
+.mcp.json
+/data/

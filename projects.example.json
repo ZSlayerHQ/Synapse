@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "projects": {
+    "my-app": {
+      "displayName": "My App",
+      "root": "/path/to/my-app",
+      "keyEnv": "SYNAPSE_KEY_MY_APP",
+      "assertableBots": ["myappbot"],
+      "roster": { "myappbot": { "displayName": "My App bot" } },
+      "sharedFiles": ["package.json"],
+      "delivery": { "myappbot": { "liveChannels": ["code"], "digestChannels": ["build", "qa"] } }
+    }
+  }
+}

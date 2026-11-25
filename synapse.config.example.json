@@ -1,0 +1,15 @@
+{
+  "$schema": "./schema/synapse.config.schema.json",
+  "version": 2,
+  "server": { "host": "127.0.0.1", "port": 4560 },
+  "defaultProject": "my-app",
+  "people": {
+    "alex": { "roles": ["owner"] },
+    "sam": { "roles": ["approver", "pingable"], "projects": ["my-app"] }
+  },
+  "owners": ["alex"],
+  "channels": ["code", "build", "qa", "reports", "tasks", "alerts"],
+  "corsOrigins": [],
+  "discord": { "enabled": false },
+  "dashboard": { "public": false }
+}

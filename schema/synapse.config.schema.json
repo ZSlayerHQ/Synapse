@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "synapse.config.schema.json",
+  "title": "Synapse bus configuration (synapse.config.json in the Synapse home)",
+  "description": "People, owners, channels and the server address. Holds no secrets: keys live in <home>/.env, and a person's key is stored only as a scrypt hash written by `synapse set-human-key`.",
+  "type": "object",
+  "required": ["version", "people", "owners"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 2 },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": { "type": "string", "default": "127.0.0.1", "description": "Bind address. Keep loopback unless the machines share a private network." },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 4560 },
+        "allowRemote": { "type": "boolean", "default": false, "description": "Required for a non-loopback host. Needs a non-empty allowedHosts and a TLS proxy in front: keys travel in HTTP headers." },
+        "allowedHosts": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9.:-]+$" }, "description": "Host header values the bus answers besides its loopback names, for example the TLS proxy's name. Every other Host is refused." }
+      },
+      "if": { "properties": { "allowRemote": { "const": true } }, "required": ["allowRemote"] },
+      "then": { "required": ["allowedHosts"], "properties": { "allowedHosts": { "minItems": 1 } } }
+    },
+    "defaultProject": { "type": "string", "description": "The project a request without X-Dev-Project belongs to. Must be in projects.json." },
+    "adminProject": { "type": "string", "description": "Reserved for operator features; must be in projects.json when set." },
+    "systemSender": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,47}$", "default": "synapse", "description": "The name the bus posts its own notices under. No bot or person may use it." },
+    "people": {
+      "type": "object",
+      "description": "Every person who may use the bus. A name not listed here is refused everywhere.",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_-]{0,31}$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "roles": { "type": "array", "items": { "enum": ["owner", "approver", "pingable"] }, "uniqueItems": true, "description": "owner: decides cards everywhere they are allowed. approver: decides cards. pingable: may be @-tagged by bots." },
+          "projects": { "type": "array", "items": { "type": "string" }, "description": "Projects this person may act in. Omit or use [\"*\"] for all." },
+          "keyHash": { "type": "string", "pattern": "^scrypt[$]", "description": "Written by `synapse set-human-key`. Never put a plaintext key here." },
+          "accounts": { "type": "object", "description": "External account ids for optional packs, for example { \"discord\": \"<user id>\" }. An id not listed here is refused by the pack.", "additionalProperties": { "anyOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] } }
+        }
+      }
+    },
+    "owners": { "type": "array", "minItems": 1, "items": { "type": "string" }, "uniqueItems": true, "description": "The people who own this bus. Each must be in people. Owners decide cards and are the default @-tag." },
+    "channels": { "type": "array", "items": { "type": "string", "pattern": "^[a-z0-9_-]{1,32}$", "not": { "enum": ["all", "direct"] } }, "default": ["code", "build", "qa", "reports", "tasks", "alerts"], "description": "The channel set. \"all\" (broadcast) and \"direct\" are reserved and always exist." },
+    "corsOrigins": { "type": "array", "items": { "type": "string", "pattern": "^https?://[^/ ]+$" }, "default": [], "description": "Extra browser origins allowed to call the API. The bus's own origin is always allowed." },
+    "discord": {
+      "type": "object",
+      "description": "The optional Discord pack. Off unless enabled; the core never loads discord.js. Set up with `synapse discord setup`.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "tokenEnv": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$", "default": "SYNAPSE_DISCORD_TOKEN", "description": "The variable in <home>/.env that holds the bot token. Never put the token itself here." },
+        "projects": {
+          "type": "object",
+          "description": "Per project: which Discord channel mirrors which bus channel, both ways. Each Discord channel belongs to one project and one bus channel.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "channels": { "type": "object", "additionalProperties": { "type": "string", "pattern": "^[0-9]{17,20}$" }, "description": "bus channel -> Discord channel id" },
+              "cards": { "type": "string", "description": "The mapped bus channel whose Discord channel gets the project's decision cards. Default: code, else the first mapped." }
+            }
+          }
+        }
+      }
+    },
+    "dashboard": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "public": { "type": "boolean", "default": false, "description": "Serve the dashboard page to non-loopback callers. The API still requires a key." } }
+    }
+  }
+}
