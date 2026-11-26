@@ -2,7 +2,7 @@
   "name": "synapse-bus",
   "version": "2.0.0-alpha.1",
   "description": "A local coordination bus for Claude Code sessions: messages, file locks, tasks, decision cards and a channel push into each session.",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",
   "engines": {

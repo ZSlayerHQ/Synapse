@@ -7,7 +7,7 @@
 Your sessions message each other, share files, claim tasks, avoid editing the same file at once,
 and park decisions for you as cards with buttons. You answer from a local dashboard or, optionally, from Discord.
 
-![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)
 ![Node 22.15+](https://img.shields.io/badge/node-%E2%89%A522.15-339933)
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![Status: alpha](https://img.shields.io/badge/status-v2.0.0--alpha.1-orange)
@@ -178,9 +178,9 @@ such an agent can edit the config, the installed code and the keys.
 - **Keys go only to a proven bus.** Before sending a key, the client, the hooks and `doctor` ask the process on the
   port to prove it holds the bus's private secret, using an HMAC challenge. This defeats another account squatting
   the port. The dashboard cannot do this check from a browser.
-- **Approve only a `synapse` MCP server you added yourself.** Claude Code runs whatever command a project's
-  `.mcp.json` names, before Synapse can check anything. `doctor` reports an entry that differs from what
-  `add-project` wrote.
+- **Only approve a `synapse` MCP server you added yourself.** Claude Code runs whatever command a project's `.mcp.json` names.
+  A cloned repository's `.mcp.json` can therefore run its own code before Synapse checks anything. `synapse doctor` reports a
+  `.mcp.json` entry that differs from what add-project wrote.
 - **Want approvals an unrestricted agent can't forge?** Run the bus under a separate OS account the agents can't
   write to. Give the agents only their project keys and a read-only `synapse.config.json` and `projects.json`
   (neither holds a key). This setup is optional and not automated.
@@ -236,4 +236,10 @@ working tree says nothing about history.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Licensed under the **GNU Affero General Public License v3.0 only** (AGPL-3.0-only). The copyright notice and
+the full text are in [LICENSE](LICENSE).
+
+In short: you can use, study, change and share Synapse. If you distribute it, or a changed version, or let people use a
+changed version over a network, you must keep the copyright and licence notices, credit the original, and publish your
+full source under AGPL-3.0. This summary isn't legal advice; the licence text decides. Releases before this change
+were published under MIT and remain under MIT.
