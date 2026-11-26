@@ -236,8 +236,8 @@ working tree says nothing about history.
 
 ## License
 
-Licensed under the **GNU Affero General Public License v3.0 only** (AGPL-3.0-only). The copyright notice and
-the full text are in [LICENSE](LICENSE).
+Licensed under the **GNU Affero General Public License v3.0 only** (AGPL-3.0-only). The copyright notice is in
+[NOTICE](NOTICE) and the full licence text in [LICENSE](LICENSE).
 
 In short: you can use, study, change and share Synapse. If you distribute it, or a changed version, or let people use a
 changed version over a network, you must keep the copyright and licence notices, credit the original, and publish your
